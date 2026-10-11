@@ -60,7 +60,7 @@ pub struct Store {
 
 // v104 publishes the Codex-specific event schema: tool calls are stored in
 // a Codex-native `tools` bucket.
-const STORE_VERSION: u32 = 104;
+const STORE_VERSION: u32 = 105;
 
 #[derive(Clone)]
 struct FileState {

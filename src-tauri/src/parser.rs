@@ -1,10 +1,10 @@
 // Parse Codex rollout JSONL, aggregate token_count events and tool calls into
-// Day / Week / Month reports + a daily heatmap.
+// Hour / Day / Week / Month / Year reports + a daily heatmap.
 use crate::account_usage::AccountUsage;
 use crate::model::*;
 use crate::pricing::Pricing;
 use crate::store::{RateLimitEvent, RawEvent, Store};
-use chrono::{DateTime, Datelike, Duration, Local, Timelike};
+use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -33,7 +33,7 @@ const OVERFLOW_GRAY: &str = "#6E7F90";
 /// Strip a trailing "-YYYYMMDD" date suffix so dated releases merge into
 /// their base model (e.g. "gpt-5-codex-20260201" -> "gpt-5-codex").
 const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    "1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月",
 ];
 
 fn normalize_model(name: &str) -> String {
@@ -69,23 +69,30 @@ fn vendor_of(model: &str) -> &'static str {
     }
 }
 
-pub fn build_dashboard() -> Dashboard {
-    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
+// Load the incrementally maintained event cache. Callers must hold BUILD_LOCK.
+fn load_store() -> Store {
     // 1. Ingest incrementally (full scan only on first run; afterwards just the
     //    appended lines), prune events older than the heatmap window, and persist
     //    only when something actually changed — so an idle tick doesn't rewrite
     //    the entire events.json every 30s.
     let mut store = Store::load();
     let mut dirty = store.ingest();
-    // Reports/heatmap span ~26 weeks (+ prev month); 210 days leaves margin.
-    let cutoff = (Local::now() - Duration::days(210)).timestamp_millis();
+    // Year comparisons need the current and previous calendar year. Keep a
+    // little over two years so January of the previous year remains available
+    // even at the end of the current year.
+    let cutoff = (Local::now() - Duration::days(760)).timestamp_millis();
     if store.prune_before(cutoff) {
         dirty = true;
     }
     if dirty {
         store.save();
     }
+    store
+}
+
+pub fn build_dashboard() -> Dashboard {
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let store = load_store();
 
     // 2. Aggregate: apply current prices and slice by current time.
     // Memoized price table (cheap clone); loaded/refreshed off-thread elsewhere
@@ -99,13 +106,31 @@ pub fn build_dashboard() -> Dashboard {
     let account_usage = crate::account_usage::load_cached();
     let rate_limits = crate::account_usage::load_cached_rate_limits()
         .or_else(|| latest_rate_limits(&store.events));
+    let mut quota_trend = crate::account_usage::load_rate_limit_history();
 
     let now = Local::now();
+    if quota_trend.is_empty() {
+        if let Some(primary) = rate_limits.as_ref().and_then(|limits| limits.primary.as_ref()) {
+            quota_trend.push(RateLimitHistoryPoint {
+                timestamp_ms: now.timestamp_millis(),
+                remaining_percent: (100.0 - primary.used_percent).clamp(0.0, 100.0),
+                secondary_remaining_percent: rate_limits
+                    .as_ref()
+                    .and_then(|limits| limits.secondary.as_ref())
+                    .map(|secondary| (100.0 - secondary.used_percent).clamp(0.0, 100.0)),
+                local_cumulative_tokens: None,
+                local_cumulative_cost: None,
+            });
+        }
+    }
+    attach_local_cumulative_usage(&events, &mut quota_trend);
     let today = now.date_naive();
 
+    let hour = report_hour(&events, now);
     let day = report_day(&events, now);
     let week = report_week(&events, now);
     let month = report_month(&events, now);
+    let year = report_year(&events, now);
     let heatmap = build_heatmap(&events, today, account_usage.as_ref());
     let profile = build_profile(&events, today, account_usage.as_ref());
 
@@ -121,14 +146,221 @@ pub fn build_dashboard() -> Dashboard {
         .unwrap_or(local_today_tokens);
 
     Dashboard {
+        hour,
         day,
         week,
         month,
+        year,
         heatmap,
         profile,
         today_tokens,
         generated_at: now.to_rfc3339(),
         rate_limits,
+        quota_trend,
+    }
+}
+
+/// Build one historical report using the same bucket and comparison semantics
+/// as the live dashboard. Negative offsets move backward by one selected unit;
+/// zero is the current period. The cache retains about 760 days, so offsets are
+/// clamped to the available history horizon.
+pub fn build_period_report(period: &str, offset: i32) -> PeriodReport {
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let store = load_store();
+    let pricing = Pricing::shared();
+    let events: Vec<Event> = store
+        .events
+        .iter()
+        .map(|raw| compute_event(raw, &pricing))
+        .collect();
+    let now = Local::now();
+    let offset = match period {
+        "Hour" => offset.clamp(-18_240, 0),
+        "Day" => offset.clamp(-760, 0),
+        "Week" => offset.clamp(-108, 0),
+        "Month" => offset.clamp(-25, 0),
+        "Year" => offset.clamp(-2, 0),
+        _ => 0,
+    };
+    let anchor = match period {
+        "Hour" => now + Duration::hours(offset as i64),
+        "Day" => now + Duration::days(offset as i64),
+        "Week" => now + Duration::weeks(offset as i64),
+        "Month" => {
+            let month_index = now.year() * 12 + now.month0() as i32 + offset;
+            let year = month_index.div_euclid(12);
+            let month = month_index.rem_euclid(12) as u32 + 1;
+            Local
+                .with_ymd_and_hms(year, month, 1, 12, 0, 0)
+                .single()
+                .unwrap_or(now)
+        }
+        "Year" => Local
+            .with_ymd_and_hms(now.year() + offset, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap_or(now),
+        _ => now,
+    };
+    match period {
+        "Hour" => report_hour(&events, anchor),
+        "Day" => report_day(&events, anchor),
+        "Week" => report_week(&events, anchor),
+        "Month" => report_month(&events, anchor),
+        "Year" => report_year(&events, anchor),
+        _ => report_week(&events, anchor),
+    }
+}
+
+/// Build a report for an arbitrary local time range. The selected range is
+/// split into twelve equal buckets and compared with the immediately preceding
+/// range of the same duration, so the delta badges retain their normal meaning.
+pub fn build_range_report(start_ms: i64, end_ms: i64) -> PeriodReport {
+    const BUCKET_COUNT: usize = 12;
+
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let store = load_store();
+    let pricing = Pricing::shared();
+    let events: Vec<Event> = store
+        .events
+        .iter()
+        .map(|raw| compute_event(raw, &pricing))
+        .collect();
+
+    let now_ms = Local::now().timestamp_millis();
+    let retained_start_ms = now_ms - Duration::days(760).num_milliseconds();
+    let end_ms = end_ms.min(now_ms).max(retained_start_ms + 60_000);
+    let start_ms = start_ms.max(retained_start_ms).min(end_ms - 60_000);
+    range_report(&events, start_ms, end_ms, BUCKET_COUNT)
+}
+
+fn range_report(events: &[Event], start_ms: i64, end_ms: i64, bucket_count: usize) -> PeriodReport {
+    let duration_ms = (end_ms - start_ms).max(60_000);
+    let previous_start_ms = start_ms.saturating_sub(duration_ms);
+    let mut agg = Agg::default();
+    let mut previous = Agg::default();
+    let mut buckets = vec![(0.0f64, 0.0f64, 0.0f64); bucket_count];
+    let mut request_buckets = vec![0.0f64; bucket_count];
+    let mut cost_buckets = vec![0.0f64; bucket_count];
+    let mut session_buckets = vec![HashSet::<String>::new(); bucket_count];
+
+    for event in events {
+        let timestamp_ms = event.ts.timestamp_millis();
+        if timestamp_ms >= start_ms && timestamp_ms <= end_ms {
+            agg.add(event);
+            let elapsed_ms = timestamp_ms.saturating_sub(start_ms);
+            let index = (((elapsed_ms as i128) * bucket_count as i128) / duration_ms as i128)
+                .min((bucket_count - 1) as i128) as usize;
+            buckets[index].0 += event.input / 1e6;
+            buckets[index].1 += event.cache / 1e6;
+            buckets[index].2 += event.output / 1e6;
+            if !event.model.is_empty() {
+                request_buckets[index] += 1.0;
+            }
+            if !event.session.is_empty() {
+                session_buckets[index].insert(event.session.clone());
+            }
+            cost_buckets[index] += event.cost;
+        } else if timestamp_ms >= previous_start_ms && timestamp_ms < start_ms {
+            previous.add(event);
+        }
+    }
+
+    let series = (0..bucket_count)
+        .map(|index| {
+            let bucket_start_ms = start_ms
+                + ((duration_ms as i128 * index as i128) / bucket_count as i128) as i64;
+            let bucket_end_ms = start_ms
+                + ((duration_ms as i128 * (index + 1) as i128) / bucket_count as i128) as i64;
+            let bucket_start = DateTime::from_timestamp_millis(bucket_start_ms)
+                .unwrap_or_default()
+                .with_timezone(&Local);
+            let bucket_end = DateTime::from_timestamp_millis(bucket_end_ms)
+                .unwrap_or_default()
+                .with_timezone(&Local);
+            let label = if index % 2 == 0 {
+                if duration_ms <= Duration::days(2).num_milliseconds() {
+                    bucket_start.format("%H:%M").to_string()
+                } else if duration_ms <= Duration::days(62).num_milliseconds() {
+                    bucket_start.format("%-m/%-d").to_string()
+                } else {
+                    bucket_start.format("%y/%-m/%-d").to_string()
+                }
+            } else {
+                String::new()
+            };
+            let full = if duration_ms <= Duration::days(2).num_milliseconds() {
+                format!(
+                    "{}–{}",
+                    bucket_start.format("%-m月%-d日 %H:%M"),
+                    bucket_end.format("%-m月%-d日 %H:%M")
+                )
+            } else {
+                format!(
+                    "{}–{}",
+                    bucket_start.format("%Y年%-m月%-d日 %H:%M"),
+                    bucket_end.format("%Y年%-m月%-d日 %H:%M")
+                )
+            };
+            SeriesPoint {
+                label,
+                full,
+                input: buckets[index].0,
+                cache: buckets[index].1,
+                output: buckets[index].2,
+            }
+        })
+        .collect();
+
+    PeriodReport {
+        metrics: agg.metrics(
+            pct_delta(
+                agg.input + agg.cache + agg.output,
+                previous.input + previous.cache + previous.output,
+            ),
+            pct_delta(agg.cost, previous.cost),
+        ),
+        series,
+        models: agg.models(),
+        tools: Agg::named(&agg.tool_counts),
+        req_trend: request_buckets,
+        cost_trend: cost_buckets,
+        session_trend: session_buckets
+            .into_iter()
+            .map(|sessions| sessions.len() as f64)
+            .collect(),
+    }
+}
+
+/// Attach a monotonic local-token counter to every official quota sample. The
+/// frontend can then compare any two samples exactly, including all Token used
+/// while the rounded official percentage stayed unchanged.
+fn attach_local_cumulative_usage(events: &[Event], points: &mut [RateLimitHistoryPoint]) {
+    let mut usage_events: Vec<(i64, f64, f64)> = events
+        .iter()
+        .map(|event| {
+            (
+                event.ts.timestamp_millis(),
+                (event.input + event.cache + event.output) / 1e6,
+                event.cost,
+            )
+        })
+        .collect();
+    usage_events.sort_by_key(|event| event.0);
+    points.sort_by_key(|point| point.timestamp_ms);
+
+    let mut event_index = 0usize;
+    let mut cumulative_tokens = 0.0;
+    let mut cumulative_cost = 0.0;
+    for point in points {
+        while event_index < usage_events.len()
+            && usage_events[event_index].0 <= point.timestamp_ms
+        {
+            cumulative_tokens += usage_events[event_index].1;
+            cumulative_cost += usage_events[event_index].2;
+            event_index += 1;
+        }
+        point.local_cumulative_tokens = Some(cumulative_tokens);
+        point.local_cumulative_cost = Some(cumulative_cost);
     }
 }
 
@@ -440,6 +672,137 @@ fn pct_delta(cur: f64, prev: f64) -> f64 {
     ((cur - prev) / prev * 10000.0).round() / 100.0
 }
 
+// ── Hour report: rolling 60 minutes vs the preceding 60 minutes ─────
+fn report_hour(events: &[Event], now: DateTime<Local>) -> PeriodReport {
+    const BUCKET_MINUTES: i64 = 5;
+    const BUCKET_COUNT: usize = 12;
+
+    let start = now - Duration::minutes(60);
+    let prev_start = start - Duration::minutes(60);
+    let mut agg = Agg::default();
+    let mut prev = Agg::default();
+    let mut buckets = vec![(0.0f64, 0.0f64, 0.0f64); BUCKET_COUNT];
+    let mut req_b = vec![0.0f64; BUCKET_COUNT];
+    let mut cost_b = vec![0.0f64; BUCKET_COUNT];
+    let mut session_b = vec![HashSet::<String>::new(); BUCKET_COUNT];
+
+    for e in events {
+        if e.ts >= start && e.ts <= now {
+            agg.add(e);
+            let elapsed = e.ts.signed_duration_since(start).num_minutes().max(0);
+            let idx = ((elapsed / BUCKET_MINUTES) as usize).min(BUCKET_COUNT - 1);
+            buckets[idx].0 += e.input / 1e6;
+            buckets[idx].1 += e.cache / 1e6;
+            buckets[idx].2 += e.output / 1e6;
+            if !e.model.is_empty() {
+                req_b[idx] += 1.0;
+            }
+            if !e.session.is_empty() {
+                session_b[idx].insert(e.session.clone());
+            }
+            cost_b[idx] += e.cost;
+        } else if e.ts >= prev_start && e.ts < start {
+            prev.add(e);
+        }
+    }
+
+    let series = (0..BUCKET_COUNT)
+        .map(|i| {
+            let bucket_start = start + Duration::minutes(i as i64 * BUCKET_MINUTES);
+            let bucket_end = bucket_start + Duration::minutes(BUCKET_MINUTES);
+            SeriesPoint {
+                label: if i % 3 == 0 {
+                    bucket_start.format("%H:%M").to_string()
+                } else {
+                    String::new()
+                },
+                full: format!(
+                    "{}–{}",
+                    bucket_start.format("%H:%M"),
+                    bucket_end.format("%H:%M")
+                ),
+                input: buckets[i].0,
+                cache: buckets[i].1,
+                output: buckets[i].2,
+            }
+        })
+        .collect();
+
+    PeriodReport {
+        metrics: agg.metrics(
+            pct_delta(
+                agg.input + agg.cache + agg.output,
+                prev.input + prev.cache + prev.output,
+            ),
+            pct_delta(agg.cost, prev.cost),
+        ),
+        series,
+        models: agg.models(),
+        tools: Agg::named(&agg.tool_counts),
+        req_trend: req_b,
+        cost_trend: cost_b,
+        session_trend: session_b.into_iter().map(|sessions| sessions.len() as f64).collect(),
+    }
+}
+
+// ── Year report: current calendar year vs previous calendar year ────
+fn report_year(events: &[Event], now: DateTime<Local>) -> PeriodReport {
+    let current_year = now.year();
+    let previous_year = current_year - 1;
+    let mut agg = Agg::default();
+    let mut prev = Agg::default();
+    let mut buckets = vec![(0.0f64, 0.0f64, 0.0f64); 12];
+    let mut req_b = vec![0.0f64; 12];
+    let mut cost_b = vec![0.0f64; 12];
+    let mut session_b = vec![HashSet::<String>::new(); 12];
+
+    for e in events {
+        let year = e.ts.year();
+        if year == current_year {
+            agg.add(e);
+            let idx = e.ts.month0() as usize;
+            buckets[idx].0 += e.input / 1e6;
+            buckets[idx].1 += e.cache / 1e6;
+            buckets[idx].2 += e.output / 1e6;
+            if !e.model.is_empty() {
+                req_b[idx] += 1.0;
+            }
+            if !e.session.is_empty() {
+                session_b[idx].insert(e.session.clone());
+            }
+            cost_b[idx] += e.cost;
+        } else if year == previous_year {
+            prev.add(e);
+        }
+    }
+
+    let series = (0..12usize)
+        .map(|i| SeriesPoint {
+            label: format!("{}月", i + 1),
+            full: format!("{}年{}月", current_year, i + 1),
+            input: buckets[i].0,
+            cache: buckets[i].1,
+            output: buckets[i].2,
+        })
+        .collect();
+
+    PeriodReport {
+        metrics: agg.metrics(
+            pct_delta(
+                agg.input + agg.cache + agg.output,
+                prev.input + prev.cache + prev.output,
+            ),
+            pct_delta(agg.cost, prev.cost),
+        ),
+        series,
+        models: agg.models(),
+        tools: Agg::named(&agg.tool_counts),
+        req_trend: req_b,
+        cost_trend: cost_b,
+        session_trend: session_b.into_iter().map(|sessions| sessions.len() as f64).collect(),
+    }
+}
+
 // ── Day report: today, 24 hourly buckets ───────────────────────────
 fn report_day(events: &[Event], now: DateTime<Local>) -> PeriodReport {
     let today = now.date_naive();
@@ -449,6 +812,7 @@ fn report_day(events: &[Event], now: DateTime<Local>) -> PeriodReport {
     let mut buckets = vec![(0.0f64, 0.0f64, 0.0f64); 24]; // (input, cache, output) M
     let mut req_b = vec![0.0f64; 24];
     let mut cost_b = vec![0.0f64; 24];
+    let mut session_b = vec![HashSet::<String>::new(); 24];
 
     for e in events {
         let d = e.ts.date_naive();
@@ -463,6 +827,9 @@ fn report_day(events: &[Event], now: DateTime<Local>) -> PeriodReport {
             // (those events carry cost 0, so this is identical today).
             if !e.model.is_empty() {
                 req_b[h] += 1.0;
+            }
+            if !e.session.is_empty() {
+                session_b[h].insert(e.session.clone());
             }
             cost_b[h] += e.cost;
         } else if d == yesterday {
@@ -498,6 +865,7 @@ fn report_day(events: &[Event], now: DateTime<Local>) -> PeriodReport {
         tools: Agg::named(&agg.tool_counts),
         req_trend: req_b,
         cost_trend: cost_b,
+        session_trend: session_b.into_iter().map(|sessions| sessions.len() as f64).collect(),
     }
 }
 
@@ -514,6 +882,7 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
     let mut buckets = vec![(0.0f64, 0.0f64, 0.0f64); 7];
     let mut req_b = vec![0.0f64; 7];
     let mut cost_b = vec![0.0f64; 7];
+    let mut session_b = vec![HashSet::<String>::new(); 7];
 
     for e in events {
         let d = e.ts.date_naive();
@@ -529,6 +898,9 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
                 if !e.model.is_empty() {
                     req_b[idx] += 1.0;
                 }
+                if !e.session.is_empty() {
+                    session_b[idx].insert(e.session.clone());
+                }
                 cost_b[idx] += e.cost;
             }
         } else if d >= prev_start && d < start {
@@ -536,7 +908,7 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
         }
     }
 
-    let weekday = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
     let series = (0..7usize)
         .map(|i| {
             let date = start + Duration::days(i as i64);
@@ -544,7 +916,7 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
             SeriesPoint {
                 label: wd.to_string(),
                 full: format!(
-                    "{} {} {}",
+                    "{} {}{}日",
                     wd,
                     MONTHS[(date.month() - 1) as usize],
                     date.day()
@@ -569,6 +941,7 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
         tools: Agg::named(&agg.tool_counts),
         req_trend: req_b,
         cost_trend: cost_b,
+        session_trend: session_b.into_iter().map(|sessions| sessions.len() as f64).collect(),
     }
 }
 
@@ -592,6 +965,7 @@ fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
     let mut buckets = vec![(0.0f64, 0.0f64, 0.0f64); days_in_month];
     let mut req_b = vec![0.0f64; days_in_month];
     let mut cost_b = vec![0.0f64; days_in_month];
+    let mut session_b = vec![HashSet::<String>::new(); days_in_month];
 
     for e in events {
         let d = e.ts.date_naive();
@@ -606,6 +980,9 @@ fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
                 // events; cost accumulates unconditionally (their cost is 0).
                 if !e.model.is_empty() {
                     req_b[idx] += 1.0;
+                }
+                if !e.session.is_empty() {
+                    session_b[idx].insert(e.session.clone());
                 }
                 cost_b[idx] += e.cost;
             }
@@ -624,7 +1001,7 @@ fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
             };
             SeriesPoint {
                 label,
-                full: format!("{} {}", MONTHS[(m - 1) as usize], dn),
+                full: format!("{}{}日", MONTHS[(m - 1) as usize], dn),
                 input: buckets[i].0,
                 cache: buckets[i].1,
                 output: buckets[i].2,
@@ -645,6 +1022,7 @@ fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
         tools: Agg::named(&agg.tool_counts),
         req_trend: req_b,
         cost_trend: cost_b,
+        session_trend: session_b.into_iter().map(|sessions| sessions.len() as f64).collect(),
     }
 }
 

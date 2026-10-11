@@ -4,7 +4,7 @@ mod parser;
 mod pricing;
 mod store;
 
-use model::Dashboard;
+use model::{Dashboard, PeriodReport};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,7 +58,7 @@ fn refresh(app: &tauri::AppHandle) {
     if let Some(tray) = app.tray_by_id("main") {
         let label = fmt_tokens_m(dash.today_tokens);
         let _ = tray.set_title(tray_title_for_platform(&label));
-        let _ = tray.set_tooltip(Some(format!("CodexScope · today {}", label)));
+        let _ = tray.set_tooltip(Some(format!("CodexScope · 今日 {}", label)));
     }
     check_milestones(app, &dash);
     let _ = app.emit("dashboard-updated", &dash);
@@ -84,6 +84,10 @@ struct Celebration {
     state: std::sync::Mutex<Option<MilestoneState>>,
     active: AtomicBool,
 }
+
+/// User-controlled pin state. The popover is already rendered above normal
+/// windows; pinning means it stays visible when focus or desktop context changes.
+struct PinnedState(AtomicBool);
 
 /// `~/Library/Application Support/codexscope/milestones.json` (platform
 /// equivalent elsewhere). Deliberately the data dir, not the Caches dir the
@@ -125,6 +129,27 @@ fn load_autostart_pref() -> Option<bool> {
 
 fn save_autostart_pref(on: bool) {
     if let Some(p) = autostart_pref_path() {
+        if let Ok(t) = serde_json::to_string(&on) {
+            let _ = std::fs::write(p, t);
+        }
+    }
+}
+
+fn pinned_pref_path() -> Option<std::path::PathBuf> {
+    let dir = dirs::data_dir()?.join("codexscope");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("pinned.json"))
+}
+
+fn load_pinned_pref() -> bool {
+    std::fs::read_to_string(pinned_pref_path().unwrap_or_default())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(false)
+}
+
+fn save_pinned_pref(on: bool) {
+    if let Some(p) = pinned_pref_path() {
         if let Ok(t) = serde_json::to_string(&on) {
             let _ = std::fs::write(p, t);
         }
@@ -547,17 +572,20 @@ fn save_popover_pos(x: i32, y: i32) {
 fn position_popover_windows(app: &tauri::AppHandle) {
     // Logical size — must match app.windows[0] width/height in tauri.conf.json.
     const POPOVER_W: f64 = 400.0;
-    const POPOVER_H: f64 = 660.0;
+    const POPOVER_H: f64 = 900.0;
     const MARGIN: f64 = 12.0; // logical px gap from the screen edges
 
     let Some(w) = app.get_webview_window("main") else {
         return;
     };
     // Force the intended size at the target monitor's DPI (recovers a stuck size).
-    let fit = |scale: f64| {
+    let fit = |monitor: &tauri::Monitor| {
+        let scale = monitor.scale_factor();
+        let max_h = (monitor.work_area().size.height as f64 / scale - MARGIN * 2.0).max(400.0);
+        let height = POPOVER_H.min(max_h);
         let _ = w.set_size(tauri::PhysicalSize::new(
             (POPOVER_W * scale).round() as u32,
-            (POPOVER_H * scale).round() as u32,
+            (height * scale).round() as u32,
         ));
     };
 
@@ -567,7 +595,7 @@ fn position_popover_windows(app: &tauri::AppHandle) {
     if let Some((sx, sy)) = load_popover_pos() {
         if let Ok(Some(m)) = w.monitor_from_point(sx as f64 + 20.0, sy as f64 + 20.0) {
             let _ = w.set_position(tauri::PhysicalPosition::new(sx, sy));
-            fit(m.scale_factor());
+            fit(&m);
             return;
         }
     }
@@ -578,7 +606,11 @@ fn position_popover_windows(app: &tauri::AppHandle) {
         .try_state::<TrayAnchor>()
         .and_then(|s| *s.0.lock().unwrap());
     let monitor = anchor
-        .and_then(|(tx, ty, _, _)| w.monitor_from_point(tx, ty).ok().flatten())
+        .and_then(|anchor| {
+            w.monitor_from_point(anchor.click_x, anchor.click_y)
+                .ok()
+                .flatten()
+        })
         .or_else(|| w.current_monitor().ok().flatten())
         .or_else(|| app.primary_monitor().ok().flatten());
 
@@ -591,7 +623,7 @@ fn position_popover_windows(app: &tauri::AppHandle) {
         let x = right - win_w - margin;
         let y = area.position.y as f64 + margin;
         let _ = w.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
-        fit(scale);
+        fit(&m);
     } else {
         // Couldn't resolve a monitor (rare) → let the positioner place it.
         let _ = w.move_window(Position::TopRight);
@@ -622,6 +654,13 @@ fn app_is_frontmost() -> bool {
 /// Spaces and can stay key across the transition.
 #[cfg(target_os = "macos")]
 fn hide_panel_on_context_switch(app: &tauri::AppHandle) {
+    if app
+        .try_state::<PinnedState>()
+        .map(|p| p.0.load(Ordering::Relaxed))
+        .unwrap_or(false)
+    {
+        return;
+    }
     if app_is_frontmost() {
         return;
     }
@@ -759,6 +798,17 @@ fn show_popover(app: &tauri::AppHandle) {
 
 #[tauri::command]
 async fn get_dashboard(app: tauri::AppHandle) -> Dashboard {
+    // Opening the popover should never leave an old quota visible for another
+    // full polling interval. Return the cached dashboard immediately, while a
+    // stale (>2 min) official quota refresh runs in the background and pushes
+    // `dashboard-updated` when it completes.
+    if account_usage::rate_limits_cache_is_stale(2 * 60 * 1000) {
+        let handle = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ = account_usage::refresh_rate_limits_cache();
+            refresh(&handle);
+        });
+    }
     // build_dashboard does blocking IO (reads/writes the cache, parses logs) and
     // holds BUILD_LOCK — running it inline would block the command on the async
     // runtime and, with a large cache, stall the UI. Hop to a blocking worker
@@ -774,10 +824,36 @@ async fn get_dashboard(app: tauri::AppHandle) -> Dashboard {
         let _ = tray.set_title(tray_title_for_platform(&label));
         // Mirror refresh(): keep the tooltip in sync for Windows, where the
         // title isn't shown next to the icon.
-        let _ = tray.set_tooltip(Some(format!("CodexScope · today {}", label)));
+        let _ = tray.set_tooltip(Some(format!("CodexScope · 今日 {}", label)));
     }
     check_milestones(&app, &dash);
     dash
+}
+
+#[tauri::command]
+async fn refresh_dashboard(app: tauri::AppHandle) -> Dashboard {
+    // Explicit refresh waits for a fresh official quota snapshot, then returns
+    // a dashboard rebuilt from both the new quota and latest local logs.
+    let _ = tauri::async_runtime::spawn_blocking(|| {
+        account_usage::force_refresh_rate_limits_cache()
+    })
+    .await;
+    get_dashboard(app).await
+}
+
+#[tauri::command]
+async fn get_period_report(period: String, offset: i32) -> PeriodReport {
+    let fallback_period = period.clone();
+    tauri::async_runtime::spawn_blocking(move || parser::build_period_report(&period, offset))
+        .await
+        .unwrap_or_else(|_| parser::build_period_report(&fallback_period, offset))
+}
+
+#[tauri::command]
+async fn get_range_report(start_ms: i64, end_ms: i64) -> PeriodReport {
+    tauri::async_runtime::spawn_blocking(move || parser::build_range_report(start_ms, end_ms))
+        .await
+        .unwrap_or_else(|_| parser::build_range_report(start_ms, end_ms))
 }
 
 /// Save a full-panel screenshot (a `data:image/png;base64,...` URL captured in
@@ -818,6 +894,23 @@ fn set_autostart_enabled(app: tauri::AppHandle, enabled: bool) -> bool {
 }
 
 #[tauri::command]
+fn get_pinned(app: tauri::AppHandle) -> bool {
+    app.try_state::<PinnedState>()
+        .map(|p| p.0.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_pinned(app: tauri::AppHandle, enabled: bool) -> bool {
+    if let Some(pinned) = app.try_state::<PinnedState>() {
+        pinned.0.store(enabled, Ordering::Relaxed);
+    }
+    save_pinned_pref(enabled);
+    let _ = app.emit("pinned-changed", enabled);
+    enabled
+}
+
+#[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
@@ -828,7 +921,9 @@ pub fn dashboard_json() -> String {
 }
 
 fn fmt_tokens_m(m: f64) -> String {
-    if m >= 100.0 {
+    if m >= 1000.0 {
+        format!("{:.2}B", m / 1000.0)
+    } else if m >= 100.0 {
         format!("{:.0}M", m)
     } else if m >= 10.0 {
         format!("{:.1}M", m)
@@ -839,7 +934,7 @@ fn fmt_tokens_m(m: f64) -> String {
         // no usage yet (e.g. just past midnight) — "0K" reads like "OK", so
         // show a clearer idle label instead.
         if k <= 0 {
-            "Ready".to_string()
+            "就绪".to_string()
         } else {
             format!("{k}K")
         }
@@ -874,9 +969,14 @@ pub fn run() {
     builder
         .invoke_handler(tauri::generate_handler![
             get_dashboard,
+            refresh_dashboard,
+            get_period_report,
+            get_range_report,
             save_screenshot,
             get_autostart_enabled,
             set_autostart_enabled,
+            get_pinned,
+            set_pinned,
             quit_app,
             begin_drag
         ])
@@ -890,6 +990,7 @@ pub fn run() {
             // position_panel (macOS, below the icon) and position_popover_windows
             // (Windows/Linux, above the icon).
             app.manage(TrayAnchor(std::sync::Mutex::new(None)));
+            app.manage(PinnedState(AtomicBool::new(load_pinned_pref())));
             // Drag-start timestamp so a drag doesn't hide the popover (non-macOS).
             #[cfg(not(target_os = "macos"))]
             app.manage(DragGuard(AtomicI64::new(0)));
@@ -928,6 +1029,13 @@ pub fn run() {
                 });
                 delegate.set_listener(Box::new(move |name: String| {
                     if name == "window_did_resign_key" {
+                        if handle
+                            .try_state::<PinnedState>()
+                            .map(|p| p.0.load(Ordering::Relaxed))
+                            .unwrap_or(false)
+                        {
+                            return;
+                        }
                         lh.store(now_ms(), Ordering::Relaxed);
                         if let Ok(panel) = handle.get_webview_panel("main") {
                             panel.order_out(None);
@@ -969,6 +1077,7 @@ pub fn run() {
             if let Some(win) = app.get_webview_window("main") {
                 let w = win.clone();
                 let lh = last_hidden.clone();
+                let handle = app.handle().clone();
                 win.on_window_event(move |e| match e {
                     WindowEvent::CloseRequested { api, .. } => {
                         api.prevent_close();
@@ -979,6 +1088,13 @@ pub fn run() {
                         let _ = w.hide();
                     }
                     WindowEvent::Focused(false) => {
+                        if handle
+                            .try_state::<PinnedState>()
+                            .map(|p| p.0.load(Ordering::Relaxed))
+                            .unwrap_or(false)
+                        {
+                            return;
+                        }
                         // A hidden window's "blur" (e.g. the one Windows fires at
                         // startup) carries a meaningless default position — only a
                         // VISIBLE popover the user clicks away from should be saved
@@ -1017,7 +1133,7 @@ pub fn run() {
             let mut tray_builder = TrayIconBuilder::with_id("main")
                 .icon(tauri::include_image!("icons/tray-icon.png"))
                 .icon_as_template(false)
-                .tooltip(format!("CodexScope · today {}", label))
+                .tooltip(format!("CodexScope · 今日 {}", label))
                 .show_menu_on_left_click(false) // left = toggle panel; non-macOS right = native menu
                 .on_tray_icon_event(move |tray, event| {
                     let app = tray.app_handle();
@@ -1088,19 +1204,19 @@ pub fn run() {
 
             #[cfg(not(target_os = "macos"))]
             {
-                let open_i = MenuItem::with_id(app, "open", "Open CodexScope", true, None::<&str>)?;
-                let refresh_i = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
+                let open_i = MenuItem::with_id(app, "open", "打开 CodexScope", true, None::<&str>)?;
+                let refresh_i = MenuItem::with_id(app, "refresh", "刷新", true, None::<&str>)?;
                 // Launch-at-login toggle (a checkbox item). Seeded from the reconciled
                 // preference; clicking it flips the OS registration and persists.
                 let autostart_i = CheckMenuItem::with_id(
                     app,
                     "autostart",
-                    "Launch at Login",
+                    "开机自动启动",
                     true,
                     autostart_on,
                     None::<&str>,
                 )?;
-                let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+                let quit_i = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
                 let menu = Menu::with_items(
                     app,
                     &[
@@ -1153,15 +1269,24 @@ pub fn run() {
                 }
             });
 
-            // Account-level usage is the source for lifetime stats and the
-            // full 25-week daily activity grid. It can take tens of seconds, so
-            // refresh it off-thread and then rebuild the dashboard from cache.
+            // Account-level usage is the source for lifetime stats. It can take
+            // tens of seconds, so keep its 15-minute loop separate from the
+            // faster official quota loop below.
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 let _ = account_usage::refresh_cache();
-                let _ = account_usage::refresh_rate_limits_cache();
                 refresh(&handle);
                 std::thread::sleep(Duration::from_secs(15 * 60));
+            });
+
+            // Official remaining quota updates every two minutes. Failed
+            // requests retain the last valid cache, so the UI never falls back
+            // to an unrelated per-model limit.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                let _ = account_usage::refresh_rate_limits_cache();
+                refresh(&handle);
+                std::thread::sleep(Duration::from_secs(2 * 60));
             });
 
             // Background refresh: keep the tray's token count current and push

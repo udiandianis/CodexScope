@@ -1,18 +1,27 @@
-use crate::model::{RateLimitSnapshot, RateLimitWindow};
+use crate::model::{RateLimitHistoryPoint, RateLimitSnapshot, RateLimitWindow};
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const REFRESH_RETRY_MS: i64 = 2 * 60 * 1000;
+const RATE_LIMIT_REFRESH_RETRY_MS: i64 = 2 * 60 * 1000;
+const RATE_LIMIT_HISTORY_RETENTION_MS: i64 = 400 * 24 * 60 * 60 * 1000;
 const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 static LAST_REFRESH_ATTEMPT_MS: AtomicI64 = AtomicI64::new(0);
 static REFRESH_LOCK: Mutex<()> = Mutex::new(());
+static LAST_RATE_LIMIT_REFRESH_ATTEMPT_MS: AtomicI64 = AtomicI64::new(0);
+static RATE_LIMIT_REFRESH_LOCK: Mutex<()> = Mutex::new(());
+static RATE_LIMIT_HISTORY_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +59,12 @@ struct CachedAccountUsage {
 struct CachedRateLimits {
     fetched_at_ms: i64,
     rate_limits: RateLimitSnapshot,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedRateLimitHistory {
+    points: Vec<RateLimitHistoryPoint>,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +144,12 @@ fn rate_limits_cache_path() -> Option<PathBuf> {
     Some(d.join("account_rate_limits.json"))
 }
 
+fn rate_limit_history_path() -> Option<PathBuf> {
+    let d = dirs::cache_dir()?.join("codexscope");
+    let _ = std::fs::create_dir_all(&d);
+    Some(d.join("account_rate_limit_history.json"))
+}
+
 fn auth_path() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("CODEX_HOME") {
         return Some(PathBuf::from(home).join("auth.json"));
@@ -148,6 +169,40 @@ pub fn load_cached_rate_limits() -> Option<RateLimitSnapshot> {
     serde_json::from_str::<CachedRateLimits>(&t)
         .ok()
         .map(|c| c.rate_limits)
+}
+
+pub fn load_rate_limit_history() -> Vec<RateLimitHistoryPoint> {
+    let _guard = RATE_LIMIT_HISTORY_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(path) = rate_limit_history_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let cutoff = now_ms() - RATE_LIMIT_HISTORY_RETENTION_MS;
+    serde_json::from_str::<CachedRateLimitHistory>(&text)
+        .map(|history| {
+            history
+                .points
+                .into_iter()
+                .filter(|point| point.timestamp_ms >= cutoff)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn rate_limits_cache_is_stale(max_age_ms: i64) -> bool {
+    let Some(path) = rate_limits_cache_path() else {
+        return true;
+    };
+    let Ok(t) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    serde_json::from_str::<CachedRateLimits>(&t)
+        .map(|c| now_ms() - c.fetched_at_ms >= max_age_ms)
+        .unwrap_or(true)
 }
 
 fn save_cached(usage: &AccountUsage) {
@@ -174,8 +229,88 @@ fn save_cached_rate_limits(rate_limits: &RateLimitSnapshot) {
     if let Ok(t) = serde_json::to_string(&cached) {
         let _ = std::fs::write(path, t);
     }
+    append_rate_limit_history(rate_limits, cached.fetched_at_ms);
 }
 
+fn append_rate_limit_history(rate_limits: &RateLimitSnapshot, timestamp_ms: i64) {
+    let Some(primary) = rate_limits.primary.as_ref() else {
+        return;
+    };
+    let _guard = RATE_LIMIT_HISTORY_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(path) = rate_limit_history_path() else {
+        return;
+    };
+    let mut history = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<CachedRateLimitHistory>(&text).ok())
+        .unwrap_or_default();
+    let cutoff = timestamp_ms - RATE_LIMIT_HISTORY_RETENTION_MS;
+    history.points.retain(|point| point.timestamp_ms >= cutoff);
+    let point = RateLimitHistoryPoint {
+        timestamp_ms,
+        remaining_percent: (100.0 - primary.used_percent).clamp(0.0, 100.0),
+        secondary_remaining_percent: rate_limits
+            .secondary
+            .as_ref()
+            .map(|secondary| (100.0 - secondary.used_percent).clamp(0.0, 100.0)),
+        local_cumulative_tokens: None,
+        local_cumulative_cost: None,
+    };
+    // A manual refresh can land immediately after the background refresh.
+    // Replace that sample instead of drawing duplicate points at the same time.
+    if history
+        .points
+        .last()
+        .map(|last| timestamp_ms - last.timestamp_ms < 30_000)
+        .unwrap_or(false)
+    {
+        if let Some(last) = history.points.last_mut() {
+            *last = point;
+        }
+    } else {
+        history.points.push(point);
+    }
+    compact_rate_limit_history(&mut history.points, timestamp_ms);
+    if let Ok(text) = serde_json::to_string(&history) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// Keep high-resolution samples for recent charts, then progressively compact
+/// old history so month/year views remain available without growing the cache
+/// by hundreds of thousands of two-minute samples.
+fn compact_rate_limit_history(points: &mut Vec<RateLimitHistoryPoint>, now: i64) {
+    const HOUR_MS: i64 = 60 * 60 * 1000;
+    const DAY_MS: i64 = 24 * HOUR_MS;
+    let raw_cutoff = now - 48 * HOUR_MS;
+    let hourly_cutoff = now - 60 * DAY_MS;
+    let mut compacted: Vec<RateLimitHistoryPoint> = Vec::with_capacity(points.len());
+    let mut last_bucket: Option<(u8, i64)> = None;
+
+    for point in points.drain(..) {
+        let bucket = if point.timestamp_ms >= raw_cutoff {
+            // Every recent sample is its own bucket.
+            (2, point.timestamp_ms)
+        } else if point.timestamp_ms >= hourly_cutoff {
+            (1, point.timestamp_ms.div_euclid(HOUR_MS))
+        } else {
+            (0, point.timestamp_ms.div_euclid(DAY_MS))
+        };
+        if last_bucket == Some(bucket) {
+            if let Some(last) = compacted.last_mut() {
+                *last = point;
+            }
+        } else {
+            compacted.push(point);
+            last_bucket = Some(bucket);
+        }
+    }
+    *points = compacted;
+}
+
+#[cfg(not(target_os = "windows"))]
 fn codex_bin() -> PathBuf {
     if let Some(p) = std::env::var_os("CODEX_BINARY") {
         return PathBuf::from(p);
@@ -185,6 +320,65 @@ fn codex_bin() -> PathBuf {
         return bundled;
     }
     PathBuf::from("codex")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_codex_cmd() -> PathBuf {
+    if let Some(p) = std::env::var_os("CODEX_BINARY") {
+        return PathBuf::from(p);
+    }
+    let mut where_command = Command::new("where.exe");
+    where_command.creation_flags(CREATE_NO_WINDOW);
+    if let Ok(output) = where_command.arg("codex.cmd").output() {
+        if output.status.success() {
+            if let Some(line) = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+            {
+                return PathBuf::from(line);
+            }
+        }
+    }
+    PathBuf::from("codex.cmd")
+}
+
+fn app_server_command() -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        // npm installs Codex as codex.cmd on Windows. Launch its JavaScript
+        // entrypoint with node.exe directly: std::process::Command cannot run a
+        // batch script, cmd.exe quoting is brittle, and the Microsoft Store
+        // package's private codex.exe is not executable by external apps.
+        let script = windows_codex_cmd();
+        if let Some(parent) = script.parent() {
+            let entry = parent
+                .join("node_modules")
+                .join("@openai")
+                .join("codex")
+                .join("bin")
+                .join("codex.js");
+            if entry.exists() {
+                let mut command = Command::new("node.exe");
+                command.creation_flags(CREATE_NO_WINDOW);
+                command.arg(entry).args(["app-server", "--stdio"]);
+                return command;
+            }
+        }
+
+        // Last-resort compatibility path for non-npm wrappers.
+        let invocation = format!("\"{}\" app-server --stdio", script.display());
+        let mut command = Command::new("cmd.exe");
+        command.creation_flags(CREATE_NO_WINDOW);
+        command.args(["/D", "/S", "/C", invocation.as_str()]);
+        command
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut command = Command::new(codex_bin());
+        command.args(["app-server", "--stdio"]);
+        command
+    }
 }
 
 fn wait_for_response(
@@ -217,8 +411,7 @@ fn wait_for_response(
 }
 
 fn query_app_server(method: &str, timeout: Duration) -> Result<serde_json::Value, String> {
-    let mut child = Command::new(codex_bin())
-        .args(["app-server", "--stdio"])
+    let mut child = app_server_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -349,10 +542,15 @@ fn query_rate_limits() -> Result<RateLimitSnapshot, String> {
             .and_then(|r| r.available_count),
         reset_credits_expires_at: None,
     };
-    if let Ok(details) = query_reset_credit_details() {
-        snapshot.reset_credits_available =
-            details.available_count.or(snapshot.reset_credits_available);
-        snapshot.reset_credits_expires_at = details.expires_at;
+    // The app-server response already contains the count. Only call the slower
+    // HTTP details endpoint when there is actually a credit whose expiry is
+    // useful to display.
+    if snapshot.reset_credits_available.unwrap_or(0) > 0 {
+        if let Ok(details) = query_reset_credit_details() {
+            snapshot.reset_credits_available =
+                details.available_count.or(snapshot.reset_credits_available);
+            snapshot.reset_credits_expires_at = details.expires_at;
+        }
     }
     Ok(snapshot)
 }
@@ -375,12 +573,44 @@ pub fn refresh_cache() -> Option<AccountUsage> {
     }
 }
 
-pub fn refresh_rate_limits_cache() -> Option<RateLimitSnapshot> {
+fn refresh_rate_limits_cache_inner(force: bool) -> Option<RateLimitSnapshot> {
+    let now = now_ms();
+    if !force
+        && now - LAST_RATE_LIMIT_REFRESH_ATTEMPT_MS.load(Ordering::Relaxed)
+            < RATE_LIMIT_REFRESH_RETRY_MS
+    {
+        return load_cached_rate_limits();
+    }
+    let Ok(_guard) = RATE_LIMIT_REFRESH_LOCK.try_lock() else {
+        return load_cached_rate_limits();
+    };
+    LAST_RATE_LIMIT_REFRESH_ATTEMPT_MS.store(now, Ordering::Relaxed);
     match query_rate_limits() {
         Ok(rate_limits) => {
             save_cached_rate_limits(&rate_limits);
             Some(rate_limits)
         }
         Err(_) => load_cached_rate_limits(),
+    }
+}
+
+pub fn refresh_rate_limits_cache() -> Option<RateLimitSnapshot> {
+    refresh_rate_limits_cache_inner(false)
+}
+
+pub fn force_refresh_rate_limits_cache() -> Option<RateLimitSnapshot> {
+    refresh_rate_limits_cache_inner(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a signed-in local Codex installation"]
+    fn live_rate_limits_can_be_read() {
+        let limits = query_rate_limits().expect("Codex rate limits should be readable");
+        assert_eq!(limits.limit_id, "codex");
+        assert!(limits.primary.is_some());
     }
 }

@@ -59,6 +59,8 @@ pub struct PeriodReport {
     pub req_trend: Vec<f64>,
     #[serde(rename = "costTrend")]
     pub cost_trend: Vec<f64>,
+    #[serde(rename = "sessionTrend")]
+    pub session_trend: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +94,20 @@ pub struct RateLimitSnapshot {
     pub reset_credits_expires_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitHistoryPoint {
+    #[serde(rename = "timestampMs")]
+    pub timestamp_ms: i64,
+    #[serde(rename = "remainingPercent")]
+    pub remaining_percent: f64,
+    #[serde(rename = "secondaryRemainingPercent")]
+    pub secondary_remaining_percent: Option<f64>,
+    #[serde(default, rename = "localCumulativeTokens", skip_serializing_if = "Option::is_none")]
+    pub local_cumulative_tokens: Option<f64>,
+    #[serde(default, rename = "localCumulativeCost", skip_serializing_if = "Option::is_none")]
+    pub local_cumulative_cost: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfileStats {
     pub source: String,
@@ -121,9 +137,11 @@ pub struct ProfileStats {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Dashboard {
+    pub hour: PeriodReport,
     pub day: PeriodReport,
     pub week: PeriodReport,
     pub month: PeriodReport,
+    pub year: PeriodReport,
     pub heatmap: Vec<HeatDay>,
     pub profile: ProfileStats,
     #[serde(rename = "todayTokens")]
@@ -132,4 +150,6 @@ pub struct Dashboard {
     pub generated_at: String,
     #[serde(rename = "rateLimits")]
     pub rate_limits: Option<RateLimitSnapshot>,
+    #[serde(rename = "quotaTrend")]
+    pub quota_trend: Vec<RateLimitHistoryPoint>,
 }
