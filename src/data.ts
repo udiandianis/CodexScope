@@ -10,7 +10,7 @@ export interface Metrics {
 }
 export interface PeriodReport {
   metrics: Metrics; series: SeriesPoint[]; models: ModelStat[];
-  tools: NamedCount[]; reqTrend: number[]; costTrend: number[];
+  tools: NamedCount[]; reqTrend: number[]; costTrend: number[]; sessionTrend: number[];
 }
 export interface HeatDay { date: string; tokens: number; level: number }
 export interface RateLimitWindow { usedPercent: number; windowMinutes: number; resetsAt: number }
@@ -19,6 +19,13 @@ export interface RateLimitSnapshot {
   primary?: RateLimitWindow | null; secondary?: RateLimitWindow | null;
   resetCreditsAvailable?: number | null;
   resetCreditsExpiresAt?: number | null;
+}
+export interface RateLimitHistoryPoint {
+  timestampMs: number;
+  remainingPercent: number;
+  secondaryRemainingPercent?: number | null;
+  localCumulativeTokens?: number | null;
+  localCumulativeCost?: number | null;
 }
 export interface ProfileStats {
   source: string;
@@ -35,8 +42,9 @@ export interface ProfileStats {
   topTools: NamedCount[];
 }
 export interface Dashboard {
-  day: PeriodReport; week: PeriodReport; month: PeriodReport;
-  heatmap: HeatDay[]; profile?: ProfileStats | null; todayTokens: number; generatedAt: string; rateLimits?: RateLimitSnapshot | null;
+  hour: PeriodReport; day: PeriodReport; week: PeriodReport; month: PeriodReport; year: PeriodReport;
+  heatmap: HeatDay[]; profile?: ProfileStats | null; todayTokens: number; generatedAt: string;
+  rateLimits?: RateLimitSnapshot | null; quotaTrend: RateLimitHistoryPoint[];
 }
 
 export async function fetchDashboard(): Promise<Dashboard> {
@@ -51,14 +59,11 @@ export async function fetchDashboard(): Promise<Dashboard> {
 
 // ── formatting helpers ──────────────────────────────────────────
 export const fmtTokens = (m: number) => {
+  if (m >= 1000) return (m / 1000).toFixed(2) + "B";
   if (m >= 1) return m.toFixed(2) + "M";
-  const k = m * 1000;
-  // one decimal for sub-1K totals (e.g. "0.4K"), but only when it rounds to a
-  // non-zero label — avoid a misleadingly precise "0.0K" for tiny values.
-  if (k >= 0.05 && k < 1) return k.toFixed(1) + "K";
-  return Math.round(k) + "K";
+  return (m * 1000).toFixed(2) + "K";
 };
-export const fmtInt = (n: number) => n.toLocaleString("en-US");
+export const fmtInt = (n: number) => n.toLocaleString("zh-CN");
 export const pct = (part: number, whole: number) => (whole > 0 ? Math.round((part / whole) * 100) : 0);
 export function fmtMoney(v: number) {
   if (v >= 100000) return "$" + Math.round(v / 1000) + "K";
@@ -122,5 +127,5 @@ export const TH: Record<"dark" | "light", Theme> = {
 
 export function fmtHeatDate(iso: string) {
   const d = new Date(iso + "T00:00:00");
-  return d.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+  return d.toLocaleDateString("zh-CN", { year: "numeric", month: "short", day: "numeric" });
 }

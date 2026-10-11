@@ -2,13 +2,12 @@ import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
-import { domToPng } from "modern-screenshot";
 import {
   Dashboard, PeriodReport, ModelStat, Theme, TH,
   fetchDashboard, fmtInt, fmtTokens,
 } from "./data";
 import {
-  TokenGlyph, Segmented, BarChart, Sparkline, CostDonut, BarList, Heatmap,
+  TokenGlyph, Segmented, BarChart, Sparkline, TrendDetail, CostDonut, Heatmap,
 } from "./charts";
 
 // Count up to `target`. Restarts from 0 whenever `resetKey` changes (popover
@@ -92,11 +91,22 @@ function ModelRow({ m, max, theme, share }: { m: ModelStat; max: number; theme: 
   );
 }
 
-function MiniStat({ label, value, sub, theme, accent, children }:
-  { label: string; value: string; sub?: string; theme: Theme; accent?: string; children?: React.ReactNode }) {
+function MiniStat({ label, labelExtra, value, sub, theme, accent, children, onClick }:
+  { label: string; labelExtra?: React.ReactNode; value: React.ReactNode; sub?: string; theme: Theme; accent?: string; children?: React.ReactNode; onClick?: () => void }) {
   return (
-    <div style={{ background: theme.gridLine, borderRadius: 9, padding: "9px 10px", minWidth: 0 }}>
-      <div style={{ font: `500 9.5px ${theme.ui}`, color: theme.dim, letterSpacing: ".04em", textTransform: "uppercase" }}>{label}</div>
+    <div data-no-drag={onClick ? "" : undefined} role={onClick ? "button" : undefined} tabIndex={onClick ? 0 : undefined}
+      onClick={onClick}
+      onKeyDown={onClick ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onClick(); } } : undefined}
+      style={{ background: theme.gridLine, borderRadius: 9, padding: "9px 10px", minWidth: 0,
+        cursor: onClick ? "pointer" : undefined, outline: "1px solid transparent",
+        transition: "outline-color .16s, background .16s" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 5 }}>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 5, minWidth: 0 }}>
+          <span style={{ font: `500 9.5px ${theme.ui}`, color: theme.dim, letterSpacing: ".04em", textTransform: "uppercase" }}>{label}</span>
+          {labelExtra}
+        </span>
+        {onClick && <span style={{ font: `600 10px ${theme.mono}`, color: theme.faint }}>↗</span>}
+      </div>
       <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginTop: 3, gap: 6 }}>
         <span style={{ font: `600 17px/1 ${theme.mono}`, color: accent || theme.text, whiteSpace: "nowrap" }}>{value}</span>
         {children}
@@ -106,10 +116,348 @@ function MiniStat({ label, value, sub, theme, accent, children }:
   );
 }
 
-function windowLabel(minutes: number) {
-  if (minutes >= 1440) return `${Math.round(minutes / 1440)}d`;
-  if (minutes >= 60) return `${Math.round(minutes / 60)}h`;
-  return `${minutes}m`;
+type TrendKind = "requests" | "cost" | "quota" | "sessions" | "peak";
+type PeriodKind = "Hour" | "Day" | "Week" | "Month" | "Year";
+type CustomRange = { startMs: number; endMs: number };
+
+function toLocalDateTimeInput(timestampMs: number) {
+  const date = new Date(timestampMs);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function customRangeLabel(range: CustomRange) {
+  const start = new Date(range.startMs);
+  const end = new Date(range.endMs);
+  const md = (date: Date) => `${date.getMonth() + 1}月${date.getDate()}日`;
+  const hm = (date: Date) => `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  return start.toDateString() === end.toDateString()
+    ? `${md(start)} ${hm(start)}–${hm(end)}`
+    : `${md(start)} ${hm(start)}–${md(end)} ${hm(end)}`;
+}
+
+function customRangePeriod(range: CustomRange): PeriodKind {
+  const duration = range.endMs - range.startMs;
+  if (duration <= 60 * 60 * 1000) return "Hour";
+  if (duration <= 24 * 60 * 60 * 1000) return "Day";
+  if (duration <= 7 * 24 * 60 * 60 * 1000) return "Week";
+  if (duration <= 62 * 24 * 60 * 60 * 1000) return "Month";
+  return "Year";
+}
+
+function activeBucketCount(period: PeriodKind, generatedAt: string) {
+  const now = new Date(generatedAt);
+  if (period === "Hour") return 12;
+  if (period === "Day") return now.getHours() + 1;
+  if (period === "Week") return ((now.getDay() + 6) % 7) + 1;
+  if (period === "Month") return now.getDate();
+  return now.getMonth() + 1;
+}
+
+function minimumPeriodOffset(period: PeriodKind) {
+  return { Hour: -18_240, Day: -760, Week: -108, Month: -25, Year: -2 }[period];
+}
+
+function periodViewEnd(period: PeriodKind, offset: number, generatedAt: string) {
+  const now = new Date(generatedAt);
+  if (offset === 0) return now;
+  if (period === "Hour") return new Date(now.getTime() + offset * 60 * 60 * 1000);
+  if (period === "Day") {
+    return new Date(new Date(now.getFullYear(), now.getMonth(), now.getDate() + offset + 1).getTime() - 1);
+  }
+  if (period === "Week") {
+    const mondayOffset = (now.getDay() + 6) % 7;
+    const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - mondayOffset);
+    return new Date(new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + offset * 7 + 7).getTime() - 1);
+  }
+  if (period === "Month") {
+    return new Date(new Date(now.getFullYear(), now.getMonth() + offset + 1, 1).getTime() - 1);
+  }
+  return new Date(new Date(now.getFullYear() + offset + 1, 0, 1).getTime() - 1);
+}
+
+function periodDisplayLabel(period: PeriodKind, offset: number, generatedAt: string) {
+  if (offset === 0) {
+    return { Hour: "最近 60 分钟", Day: "今天 00:00 至今", Week: "本周", Month: "本月", Year: "本年" }[period];
+  }
+  const end = periodViewEnd(period, offset, generatedAt);
+  const md = (date: Date) => `${date.getMonth() + 1}月${date.getDate()}日`;
+  const hm = (date: Date) => `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (period === "Hour") {
+    const start = new Date(end.getTime() - 60 * 60 * 1000);
+    return start.toDateString() === end.toDateString()
+      ? `${md(end)} ${hm(start)}–${hm(end)}`
+      : `${md(start)} ${hm(start)}–${md(end)} ${hm(end)}`;
+  }
+  if (period === "Day") return md(end);
+  if (period === "Week") {
+    const start = new Date(periodStartMs("Week", end));
+    return start.getMonth() === end.getMonth()
+      ? `${start.getMonth() + 1}月${start.getDate()}–${end.getDate()}日`
+      : `${md(start)}–${md(end)}`;
+  }
+  if (period === "Month") return `${end.getFullYear()}年${end.getMonth() + 1}月`;
+  return `${end.getFullYear()}年`;
+}
+
+function periodStartMs(period: PeriodKind, now: Date) {
+  if (period === "Hour") return now.getTime() - 60 * 60 * 1000;
+  if (period === "Day") return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  if (period === "Week") {
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate() - ((now.getDay() + 6) % 7)).getTime();
+  }
+  if (period === "Month") return new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  return new Date(now.getFullYear(), 0, 1).getTime();
+}
+
+function quotaSampleLabel(timestampMs: number, period: PeriodKind) {
+  const date = new Date(timestampMs);
+  if (period === "Hour" || period === "Day") {
+    return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+  }
+  return date.toLocaleString("zh-CN", {
+    month: "numeric", day: "numeric",
+    ...(period === "Year" ? {} : { hour: "2-digit", minute: "2-digit", hour12: false }),
+  });
+}
+
+function quotaEfficiency(points: Dashboard["quotaTrend"], period: PeriodKind, generatedAt: string, explicitStartMs?: number) {
+  const now = new Date(generatedAt);
+  const periodStart = explicitStartMs ?? periodStartMs(period, now);
+  const sorted = [...points].filter((point) => point.timestampMs <= now.getTime()).sort((a, b) => a.timestampMs - b.timestampMs);
+  const latestPoint = sorted[sorted.length - 1];
+  const currentRemaining = latestPoint?.remainingPercent ?? 0;
+  const empty = { averageTokens: null, averageCost: null, lastCompletedTokens: null, lastCompletedCost: null,
+    currentTokens: 0, currentCost: 0, completedPercent: 0, segmentCosts: [] as number[], segmentLabels: [] as string[],
+    currentRemaining };
+  if (sorted.length < 2) return empty;
+
+  let segmentStart = sorted[0];
+  let completedTokens = 0;
+  let completedCost = 0;
+  let completedPercent = 0;
+  let lastCompletedTokens: number | null = null;
+  let lastCompletedCost: number | null = null;
+  const segmentCosts: number[] = [];
+  const segmentLabels: string[] = [];
+  for (let i = 1; i < sorted.length; i++) {
+    const previous = sorted[i - 1];
+    const current = sorted[i];
+    // A quota reset discards the unfinished old segment and starts a new one.
+    if (current.remainingPercent > previous.remainingPercent) {
+      segmentStart = current;
+      continue;
+    }
+    const drop = previous.remainingPercent - current.remainingPercent;
+    if (drop <= 0) continue;
+    const startTokens = segmentStart.localCumulativeTokens;
+    const endTokens = current.localCumulativeTokens;
+    const startCost = segmentStart.localCumulativeCost;
+    const endCost = current.localCumulativeCost;
+    // Attribute a completed 1% segment to the period in which its official
+    // boundary was crossed. The current unfinished segment is never included.
+    const completedInPeriod = current.timestampMs >= periodStart;
+    if (completedInPeriod && startTokens != null && endTokens != null) {
+      const segmentTokens = Math.max(0, endTokens - startTokens);
+      completedTokens += segmentTokens;
+      lastCompletedTokens = segmentTokens / drop;
+    }
+    if (completedInPeriod && startCost != null && endCost != null) {
+      const segmentCost = Math.max(0, endCost - startCost);
+      completedCost += segmentCost;
+      lastCompletedCost = segmentCost / drop;
+      segmentCosts.push(lastCompletedCost);
+      segmentLabels.push(`${Math.round(segmentStart.remainingPercent)}%→${Math.round(current.remainingPercent)}% · ${quotaSampleLabel(current.timestampMs, period)}`);
+    }
+    if (completedInPeriod) completedPercent += drop;
+    segmentStart = current;
+  }
+
+  const latest = sorted[sorted.length - 1];
+  const currentTokens = segmentStart.localCumulativeTokens != null && latest.localCumulativeTokens != null
+    ? Math.max(0, latest.localCumulativeTokens - segmentStart.localCumulativeTokens) : 0;
+  const currentCost = segmentStart.localCumulativeCost != null && latest.localCumulativeCost != null
+    ? Math.max(0, latest.localCumulativeCost - segmentStart.localCumulativeCost) : 0;
+  return {
+    averageTokens: completedPercent > 0 ? completedTokens / completedPercent : null,
+    averageCost: completedPercent > 0 ? completedCost / completedPercent : null,
+    lastCompletedTokens,
+    lastCompletedCost,
+    currentTokens,
+    currentCost,
+    completedPercent,
+    segmentCosts,
+    segmentLabels,
+    currentRemaining,
+  };
+}
+
+function quotaPeriodTrend(points: Dashboard["quotaTrend"], period: PeriodKind, generatedAt: string, count: number, explicitStartMs?: number) {
+  const now = new Date(generatedAt);
+  const nowMs = now.getTime();
+  const sorted = [...points].filter((point) => point.timestampMs <= nowMs).sort((a, b) => a.timestampMs - b.timestampMs);
+  if (!sorted.length || count <= 0) return { values: [] as number[], labels: [] as string[], annotations: [] as string[] };
+  const requestedStart = explicitStartMs ?? periodStartMs(period, now);
+  const beforeStart = [...sorted].reverse().find((point) => point.timestampMs <= requestedStart);
+  const firstInside = sorted.find((point) => point.timestampMs >= requestedStart);
+  const baseline = beforeStart || firstInside || sorted[0];
+  const startMs = beforeStart ? requestedStart : baseline.timestampMs;
+
+  const boundaries: Array<{ timestampMs: number; drop: number; cost: number }> = [];
+  let segmentStart = sorted[0];
+  for (let i = 1; i < sorted.length; i++) {
+    const previous = sorted[i - 1];
+    const current = sorted[i];
+    if (current.remainingPercent > previous.remainingPercent) {
+      segmentStart = current;
+      continue;
+    }
+    const drop = previous.remainingPercent - current.remainingPercent;
+    if (drop <= 0) continue;
+    const cost = segmentStart.localCumulativeCost != null && current.localCumulativeCost != null
+      ? Math.max(0, current.localCumulativeCost - segmentStart.localCumulativeCost) : 0;
+    boundaries.push({ timestampMs: current.timestampMs, drop, cost });
+    segmentStart = current;
+  }
+
+  const values: number[] = [];
+  const labels: string[] = [];
+  const annotations: string[] = [];
+  let previousTarget = startMs - 1;
+  for (let i = 0; i < count; i++) {
+    const target = count === 1 ? nowMs : startMs + ((nowMs - startMs) * i) / (count - 1);
+    let latest = baseline;
+    let activeStart = sorted[0];
+    for (let j = 0; j < sorted.length; j++) {
+      const point = sorted[j];
+      if (point.timestampMs > target) break;
+      latest = point;
+      if (j > 0) {
+        const previous = sorted[j - 1];
+        if (point.remainingPercent !== previous.remainingPercent) activeStart = point;
+      }
+    }
+    const completed = boundaries.filter((boundary) => boundary.timestampMs > previousTarget && boundary.timestampMs <= target);
+    if (completed.length) {
+      const completedPercent = completed.reduce((sum, boundary) => sum + boundary.drop, 0);
+      const completedCost = completed.reduce((sum, boundary) => sum + boundary.cost, 0);
+      annotations.push(completedPercent === 1
+        ? `上个 1% $${fmtPeakCost(completedCost)}`
+        : `本区间 ${completedPercent.toFixed(0)}% 均 $${fmtPeakCost(completedCost / completedPercent)}`);
+    } else {
+      const currentCost = activeStart.localCumulativeCost != null && latest.localCumulativeCost != null
+        ? Math.max(0, latest.localCumulativeCost - activeStart.localCumulativeCost) : 0;
+      annotations.push(`当前 1% 累计 $${fmtPeakCost(currentCost)}`);
+    }
+    values.push(latest.remainingPercent);
+    labels.push(quotaSampleLabel(target, period));
+    previousTarget = target;
+  }
+  return { values, labels, annotations };
+}
+
+function TrendOverlay({ kind, report, quotaTrendData, quotaEfficiencyData, peakUnit, bucketCount, periodLabel, theme, onClose }:
+  { kind: TrendKind; report: PeriodReport; quotaTrendData: ReturnType<typeof quotaPeriodTrend>; quotaEfficiencyData: ReturnType<typeof quotaEfficiency>; peakUnit: "tokens" | "cost"; bucketCount: number; periodLabel: string; theme: Theme; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const peakValues = report.series.slice(0, bucketCount).map((point) => point.input + point.cache + point.output);
+  const values = kind === "quota"
+    ? quotaTrendData.values
+    : kind === "requests"
+      ? report.reqTrend.slice(0, bucketCount)
+      : kind === "cost"
+        ? report.costTrend.slice(0, bucketCount)
+        : kind === "sessions"
+          ? (report.sessionTrend || []).slice(0, bucketCount)
+          : peakUnit === "tokens" ? peakValues : report.costTrend.slice(0, bucketCount);
+  const labels = kind === "quota"
+    ? quotaTrendData.labels
+    : report.series.slice(0, bucketCount).map((s) => s.full);
+  const chartValues = values;
+  const chartLabels = labels;
+  const total = values.reduce((s, v) => s + v, 0);
+  const average = values.length ? total / values.length : 0;
+  const peak = Math.max(...values, 0);
+  const peakIndex = values.indexOf(peak);
+  const active = values.filter((v) => v > 0).length;
+  const startingRemaining = quotaTrendData.values[0] ?? quotaEfficiencyData.currentRemaining;
+  const title = kind === "requests"
+    ? "响应次数详细趋势"
+    : kind === "cost"
+      ? "API 等值费用详细趋势"
+      : kind === "sessions"
+        ? "会话数详细趋势"
+        : kind === "peak"
+          ? "阶段峰值详细趋势"
+          : "剩余额度详细趋势";
+  const formatValue = kind === "requests"
+    ? (v: number, _index?: number) => `${fmtInt(Math.round(v))}次`
+    : kind === "cost"
+      ? (v: number, _index?: number) => v > 0 && v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`
+      : kind === "sessions"
+        ? (v: number, _index?: number) => `${fmtInt(Math.round(v))}个`
+        : kind === "peak"
+          ? peakUnit === "tokens"
+            ? (v: number, _index?: number) => fmtPeakTokens(v)
+            : (v: number, _index?: number) => `$${fmtPeakCost(v)}`
+          : (v: number, index = 0) => `${Math.round(v)}% · ${quotaTrendData.annotations[index] || ""}`;
+  const summary = kind === "quota" ? [
+    ["当前额度", `${Math.round(quotaEfficiencyData.currentRemaining)}%`],
+    ["阶段起始", `${Math.round(startingRemaining)}%`],
+    ["已完成 1% 均值", quotaEfficiencyData.averageCost != null ? `$${fmtPeakCost(quotaEfficiencyData.averageCost)}` : "待累计"],
+    ["当前 1% 累计", quotaEfficiencyData.currentCost > 0 ? `$${fmtPeakCost(quotaEfficiencyData.currentCost)}` : "$0.00"],
+  ] : kind === "sessions" ? [
+    ["期间去重", `${fmtInt(report.metrics.sessions)}个`],
+    ["桶均", `${average.toFixed(2)}个`],
+    ["峰值", formatValue(peak, peakIndex)],
+    ["活跃", `${active}/${values.length}`],
+  ] : kind === "peak" ? [
+    ["总计", formatValue(total)],
+    ["桶均", formatValue(average)],
+    ["峰值", formatValue(peak, peakIndex)],
+    ["活跃", `${active}/${values.length}`],
+  ] : [
+    ["总计", formatValue(total)],
+    ["平均", formatValue(average)],
+    ["峰值", formatValue(peak)],
+    ["活跃", `${active}/${values.length}`],
+  ];
+  const displayPeriod = periodLabel;
+  const detailTitle = kind === "quota"
+    ? labels[0] ? `阶段起点：${labels[0]} · ${Math.round(startingRemaining)}%` : displayPeriod
+    : labels[peakIndex] ? `峰值区间：${labels[peakIndex]}` : displayPeriod;
+
+  return <>
+    <div data-no-drag="" onClick={onClose} style={{ position: "absolute", inset: 0, zIndex: 30, borderRadius: 12,
+      background: "rgba(0,0,0,0.42)", backdropFilter: "blur(1px)" }} />
+    <div data-no-drag="" role="dialog" aria-modal="true" aria-label={title} onClick={(e) => e.stopPropagation()}
+      style={{ position: "absolute", zIndex: 31, left: 8, right: 8, top: "50%", transform: "translateY(-50%)",
+        borderRadius: 13, padding: "12px 12px 11px", background: theme.card,
+        border: `1px solid ${theme.segBorder}`, boxShadow: "0 18px 50px rgba(0,0,0,0.5)" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 9 }}>
+        <div>
+          <div style={{ font: `700 13px ${theme.ui}`, color: theme.text }}>{title}</div>
+          <div style={{ marginTop: 2, font: `500 8.5px ${theme.mono}`, color: theme.faint }}>
+            {displayPeriod}{kind === "quota" ? ` · ${values.length}个额度节点` : ""} · 悬停折线查看每个区间
+          </div>
+        </div>
+        <button onClick={onClose} aria-label="关闭详细趋势" style={{ width: 26, height: 26, border: 0, borderRadius: 7,
+          background: theme.gridLine, color: theme.dim, cursor: "pointer", font: `600 15px ${theme.ui}` }}>×</button>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 5, marginBottom: 8 }}>
+        {summary.map(([label, value]) => <div key={label} style={{ minWidth: 0, borderRadius: 8, padding: "7px 7px 6px", background: theme.segBg }}>
+          <div style={{ font: `500 8px ${theme.ui}`, color: theme.faint }}>{label}</div>
+          <div style={{ marginTop: 3, font: `700 11px ${theme.mono}`, color: theme.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{value}</div>
+        </div>)}
+      </div>
+      <TrendDetail title={detailTitle}
+        values={chartValues} labels={chartLabels} theme={theme} accent={theme.accent} formatValue={formatValue} />
+    </div>
+  </>;
 }
 
 function remainingPct(used?: number) {
@@ -117,43 +465,18 @@ function remainingPct(used?: number) {
   return Math.max(0, Math.min(100, 100 - used));
 }
 
-function resetCreditExpiryLabel(unixSeconds?: number | null) {
-  if (!unixSeconds) return "";
-  const d = new Date(unixSeconds * 1000);
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  return `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`;
-}
-
-function durationLabel(minutes: number) {
-  if (minutes <= 0) return "0m";
-  const total = Math.round(minutes);
-  const days = Math.floor(total / 1440);
-  const hours = Math.floor((total % 1440) / 60);
-  const mins = total % 60;
-  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
-  if (hours > 0) return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
-  return `${mins}m`;
-}
-
 function fmtProfileTokens(m: number) {
-  if (m >= 1000) {
-    const b = m / 1000;
-    return `${b >= 10 ? b.toFixed(1) : b.toFixed(2)}B`;
-  }
   return fmtTokens(m);
 }
 
-function effortLabel(effort: string) {
-  const labels: Record<string, string> = {
-    none: "None",
-    minimal: "Minimal",
-    low: "Low",
-    medium: "Medium",
-    high: "High",
-    xhigh: "Ultra",
-  };
-  return labels[effort] || (effort ? effort : "—");
+function fmtPeakCost(value: number) {
+  return Math.max(0, value).toFixed(2);
+}
+
+function fmtPeakTokens(millions: number) {
+  if (millions >= 1000) return `${(millions / 1000).toFixed(2)}B`;
+  if (millions >= 1) return `${millions.toFixed(2)}M`;
+  return `${(millions * 1000).toFixed(2)}K`;
 }
 
 // Input/Cached/Output legend: full words by default, abbreviated only
@@ -164,9 +487,9 @@ function SplitLegend({ t, inputM, cacheM, outputM }:
   const [compact, setCompact] = useState(false);
   const key = `${inputM}|${cacheM}|${outputM}`;
   const parts = [
-    { label: "Input", compact: "In", color: t.accent, value: inputM },
-    ...(cacheM > 0 ? [{ label: "Cached", compact: "Cache", color: t.cacheCol, value: cacheM }] : []),
-    { label: "Output", compact: "Out", color: t.accentSoft, value: outputM },
+    { label: "输入", compact: "入", color: t.accent, value: inputM },
+    ...(cacheM > 0 ? [{ label: "缓存", compact: "缓", color: t.cacheCol, value: cacheM }] : []),
+    { label: "输出", compact: "出", color: t.accentSoft, value: outputM },
   ];
   // reset to full labels whenever the numbers change, then re-measure
   useLayoutEffect(() => { setCompact(false); }, [key]);
@@ -196,9 +519,9 @@ const Label = ({ t, children }: { t: Theme; children: React.ReactNode }) => (
 function ThemeToggle({ pref, theme, onCycle }: { pref: "dark" | "light" | "system"; theme: Theme; onCycle: () => void }) {
   const t = theme;
   // Single button cycling Dark → Light → System; the icon shows the current mode.
-  const label = pref === "system" ? "System" : pref === "dark" ? "Dark" : "Light";
+  const label = pref === "system" ? "跟随系统" : pref === "dark" ? "深色" : "浅色";
   return (
-    <button onClick={onCycle} title={`Theme: ${label} (click to change)`} aria-label={`theme: ${label}`} style={{
+    <button onClick={onCycle} title={`主题：${label}（点击切换）`} aria-label={`主题：${label}`} style={{
       display: "inline-flex", alignItems: "center", justifyContent: "center",
       width: 26, height: 26, borderRadius: 7, cursor: "pointer", padding: 0,
       background: t.segBg, border: `1px solid ${t.segBorder}`, color: t.dim,
@@ -222,32 +545,111 @@ function ThemeToggle({ pref, theme, onCycle }: { pref: "dark" | "light" | "syste
   );
 }
 
-function ScreenshotButton({ theme, busy, onClick }: { theme: Theme; busy: boolean; onClick: () => void }) {
-  const t = theme;
-  return (
-    <button onClick={onClick} disabled={busy} title="Save screenshot to Desktop" aria-label="save screenshot" style={{
-      display: "inline-flex", alignItems: "center", justifyContent: "center",
-      width: 26, height: 26, borderRadius: 7, cursor: busy ? "default" : "pointer", padding: 0,
-      background: t.segBg, border: `1px solid ${t.segBorder}`, color: t.dim,
-    }}>
-      {busy ? (
-        <svg className="om-spin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={t.dim} strokeWidth="2.6" strokeLinecap="round">
-          <path d="M12 3a9 9 0 1 0 9 9" />
-        </svg>
-      ) : (
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={t.dim} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M3 8.5A2.5 2.5 0 0 1 5.5 6h1.7l1.1-1.6A1.5 1.5 0 0 1 9.5 4h5a1.5 1.5 0 0 1 1.2.4L16.8 6h1.7A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />
-          <circle cx="12" cy="12.2" r="3.4" />
-        </svg>
-      )}
-    </button>
-  );
+function CustomRangeOverlay({ initialRange, theme, onApply, onClose }: {
+  initialRange: CustomRange;
+  theme: Theme;
+  onApply: (range: CustomRange) => void;
+  onClose: () => void;
+}) {
+  const [start, setStart] = useState(() => toLocalDateTimeInput(initialRange.startMs));
+  const [end, setEnd] = useState(() => toLocalDateTimeInput(initialRange.endMs));
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const choosePreset = (durationMs: number) => {
+    const presetEnd = Date.now();
+    setStart(toLocalDateTimeInput(presetEnd - durationMs));
+    setEnd(toLocalDateTimeInput(presetEnd));
+    setError("");
+  };
+  const apply = () => {
+    const startMs = new Date(start).getTime();
+    const endMs = new Date(end).getTime();
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+      setError("请选择完整的开始和结束时间");
+      return;
+    }
+    if (startMs >= endMs) {
+      setError("结束时间必须晚于开始时间");
+      return;
+    }
+    if (endMs - startMs < 60_000) {
+      setError("时间段至少需要 1 分钟");
+      return;
+    }
+    if (endMs > Date.now() + 60_000) {
+      setError("结束时间不能晚于当前时间");
+      return;
+    }
+    if (startMs < Date.now() - 760 * 24 * 60 * 60 * 1000) {
+      setError("本地统计最多保留约 760 天");
+      return;
+    }
+    onApply({ startMs, endMs: Math.min(endMs, Date.now()) });
+  };
+  const inputStyle: CSSProperties = {
+    width: "100%", boxSizing: "border-box", borderRadius: 8,
+    border: `1px solid ${theme.segBorder}`, background: theme.segBg, color: theme.text,
+    padding: "8px 9px", font: `500 11px ${theme.mono}`, outline: "none",
+    colorScheme: theme.card === "#181818" ? "dark" : "light",
+  };
+
+  return <>
+    <div data-no-drag="" onClick={onClose} style={{ position: "absolute", inset: 0, zIndex: 40, borderRadius: 12,
+      background: "rgba(0,0,0,0.42)", backdropFilter: "blur(1px)" }} />
+    <div data-no-drag="" role="dialog" aria-modal="true" aria-label="时间段统计"
+      style={{ position: "absolute", zIndex: 41, left: 12, right: 12, top: "50%", transform: "translateY(-50%)",
+        borderRadius: 13, padding: "13px", background: theme.card, border: `1px solid ${theme.segBorder}`,
+        boxShadow: "0 18px 50px rgba(0,0,0,0.5)" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <div>
+          <div style={{ font: `700 13px ${theme.ui}`, color: theme.text }}>时间段统计</div>
+          <div style={{ marginTop: 2, font: `500 8.5px ${theme.mono}`, color: theme.faint }}>12 个等长分段 · 涨跌对比前一等长时间段</div>
+        </div>
+        <button onClick={onClose} aria-label="关闭" style={{ width: 26, height: 26, border: 0, borderRadius: 7,
+          background: theme.gridLine, color: theme.dim, cursor: "pointer", font: `600 15px ${theme.ui}` }}>×</button>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 5, marginBottom: 10 }}>
+        {[
+          ["1小时", 60 * 60 * 1000], ["6小时", 6 * 60 * 60 * 1000], ["24小时", 24 * 60 * 60 * 1000],
+          ["7天", 7 * 24 * 60 * 60 * 1000], ["30天", 30 * 24 * 60 * 60 * 1000],
+        ].map(([label, duration]) => <button key={label as string} onClick={() => choosePreset(duration as number)} style={{
+          border: `1px solid ${theme.segBorder}`, borderRadius: 7, padding: "6px 2px", cursor: "pointer",
+          background: theme.segBg, color: theme.dim, font: `600 9px ${theme.ui}`,
+        }}>{label}</button>)}
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        <label style={{ font: `600 9px ${theme.ui}`, color: theme.dim }}>开始
+          <input type="datetime-local" value={start} max={end} onChange={(event) => { setStart(event.target.value); setError(""); }} style={{ ...inputStyle, marginTop: 5 }} />
+        </label>
+        <label style={{ font: `600 9px ${theme.ui}`, color: theme.dim }}>结束
+          <input type="datetime-local" value={end} min={start} max={toLocalDateTimeInput(Date.now())} onChange={(event) => { setEnd(event.target.value); setError(""); }} style={{ ...inputStyle, marginTop: 5 }} />
+        </label>
+      </div>
+      <div style={{ minHeight: 18, paddingTop: 5, font: `500 9px ${theme.ui}`, color: error ? "#e0795f" : theme.faint }}>
+        {error || "统计来自本机 Codex 日志；费用为 API 等值估算"}
+      </div>
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 7, marginTop: 4 }}>
+        <button onClick={onClose} style={{ border: `1px solid ${theme.segBorder}`, borderRadius: 8, padding: "7px 13px",
+          background: theme.segBg, color: theme.dim, cursor: "pointer", font: `600 10.5px ${theme.ui}` }}>取消</button>
+        <button onClick={apply} style={{ border: 0, borderRadius: 8, padding: "7px 15px",
+          background: theme.accent, color: "#fff", cursor: "pointer", font: `700 10.5px ${theme.ui}` }}>查看统计</button>
+      </div>
+    </div>
+  </>;
 }
 
-function AppMenuButton({ theme, onRefresh, showToast }: {
+function AppMenuButton({ theme, onRefresh, onCustomRange, showToast, pinned, onPinnedChange }: {
   theme: Theme;
   onRefresh: () => Promise<void>;
+  onCustomRange: () => void;
   showToast: (msg: string, ok: boolean) => void;
+  pinned: boolean;
+  onPinnedChange: (pinned: boolean) => void;
 }) {
   const t = theme;
   const ref = useRef<HTMLDivElement>(null);
@@ -280,6 +682,9 @@ function AppMenuButton({ theme, onRefresh, showToast }: {
     invoke<boolean>("get_autostart_enabled")
       .then(setAutostart)
       .catch(() => setAutostart(false));
+    invoke<boolean>("get_pinned")
+      .then(onPinnedChange)
+      .catch(() => onPinnedChange(false));
   }, [inTauri]);
 
   const itemStyle: CSSProperties = {
@@ -297,19 +702,19 @@ function AppMenuButton({ theme, onRefresh, showToast }: {
     cursor: busy ? "default" : "pointer",
     textAlign: "left",
   };
-  const checkStyle: CSSProperties = {
+  const checkStyle = (checked: boolean): CSSProperties => ({
     width: 14,
     height: 14,
     borderRadius: 4,
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    border: `1px solid ${autostart ? t.accent : t.segBorder}`,
-    background: autostart ? t.accent : t.segBg,
+    border: `1px solid ${checked ? t.accent : t.segBorder}`,
+    background: checked ? t.accent : t.segBg,
     color: "#fff",
     font: `700 10px ${t.ui}`,
     flex: "0 0 auto",
-  };
+  });
 
   const doRefresh = async () => {
     if (busy) return;
@@ -317,9 +722,9 @@ function AppMenuButton({ theme, onRefresh, showToast }: {
     try {
       await onRefresh();
       setOpen(false);
-      showToast("Refreshed", true);
+      showToast("已刷新", true);
     } catch {
-      showToast("Refresh failed", false);
+      showToast("刷新失败", false);
     } finally {
       setBusy(false);
     }
@@ -332,9 +737,24 @@ function AppMenuButton({ theme, onRefresh, showToast }: {
     try {
       const actual = await invoke<boolean>("set_autostart_enabled", { enabled: next });
       setAutostart(actual);
-      showToast(actual ? "Launch at Login on" : "Launch at Login off", true);
+      showToast(actual ? "已开启开机自启" : "已关闭开机自启", true);
     } catch {
-      showToast("Launch setting failed", false);
+      showToast("开机自启设置失败", false);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const togglePinned = async () => {
+    if (busy || !inTauri) return;
+    const next = !pinned;
+    setBusy(true);
+    try {
+      const actual = await invoke<boolean>("set_pinned", { enabled: next });
+      onPinnedChange(actual);
+      showToast(actual ? "窗口已置顶" : "已取消置顶", true);
+    } catch {
+      showToast("置顶设置失败", false);
     } finally {
       setBusy(false);
     }
@@ -342,12 +762,12 @@ function AppMenuButton({ theme, onRefresh, showToast }: {
 
   const quit = () => {
     if (!inTauri) return;
-    invoke("quit_app").catch(() => showToast("Quit failed", false));
+    invoke("quit_app").catch(() => showToast("退出失败", false));
   };
 
   return (
     <div ref={ref} style={{ position: "relative" }}>
-      <button onClick={() => setOpen((v) => !v)} title="Menu" aria-label="menu" aria-haspopup="menu" aria-expanded={open} style={{
+      <button onClick={() => setOpen((v) => !v)} title="菜单" aria-label="菜单" aria-haspopup="menu" aria-expanded={open} style={{
         display: "inline-flex", alignItems: "center", justifyContent: "center",
         width: 26, height: 26, borderRadius: 7, cursor: "pointer", padding: 0,
         background: open ? t.segOnBg : t.segBg, border: `1px solid ${t.segBorder}`, color: t.dim,
@@ -366,16 +786,24 @@ function AppMenuButton({ theme, onRefresh, showToast }: {
           boxShadow: "0 14px 36px rgba(0,0,0,0.28)",
         }}>
           <button role="menuitem" disabled={busy} onClick={doRefresh} style={itemStyle}>
-            <span>Refresh</span>
+            <span>刷新</span>
             {busy && <span style={{ color: t.faint, font: `600 10px ${t.mono}` }}>...</span>}
           </button>
+          <button role="menuitem" disabled={busy} onClick={() => { setOpen(false); onCustomRange(); }} style={itemStyle}>
+            <span>时间段统计</span>
+            <span style={{ color: t.faint, font: `700 12px ${t.mono}` }}>↗</span>
+          </button>
+          <button role="menuitemcheckbox" aria-checked={pinned} disabled={busy || !inTauri} onClick={togglePinned} style={itemStyle}>
+            <span>置顶</span>
+            <span style={checkStyle(pinned)}>{pinned ? "✓" : ""}</span>
+          </button>
           <button role="menuitemcheckbox" aria-checked={!!autostart} disabled={busy || !inTauri} onClick={toggleAutostart} style={itemStyle}>
-            <span>Launch at Login</span>
-            <span style={checkStyle}>{autostart ? "✓" : ""}</span>
+            <span>开机自动启动</span>
+            <span style={checkStyle(!!autostart)}>{autostart ? "✓" : ""}</span>
           </button>
           <div style={{ height: 1, background: t.gridLine, margin: "4px 3px" }} />
           <button role="menuitem" onClick={quit} style={{ ...itemStyle, color: "#e0795f" }}>
-            <span>Quit</span>
+            <span>退出</span>
           </button>
         </div>
       )}
@@ -403,12 +831,58 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
   // / dismisses and never arms the hide-suppression guard.
   const canDrag = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window && !navigator.userAgent.includes("Macintosh");
   const dragRef = useRef<{ x: number; y: number } | null>(null);
-  const [period, setPeriod] = useState<"Day" | "Week" | "Month">("Week");
-  const P: PeriodReport = period === "Day" ? dash.day : period === "Month" ? dash.month : dash.week;
+  const [period, setPeriod] = useState<PeriodKind>("Week");
+  const [periodOffset, setPeriodOffset] = useState(0);
+  const [historicalReport, setHistoricalReport] = useState<{ key: string; report: PeriodReport } | null>(null);
+  const [customRange, setCustomRange] = useState<CustomRange | null>(null);
+  const [customReport, setCustomReport] = useState<{ key: string; report: PeriodReport } | null>(null);
+  const [rangePickerOpen, setRangePickerOpen] = useState(false);
+  const [detailKind, setDetailKind] = useState<TrendKind | null>(null);
+  const [peakUnit, setPeakUnit] = useState<"tokens" | "cost">("tokens");
+  const [pinned, setPinned] = useState(false);
+  const currentReport: PeriodReport = period === "Hour" ? dash.hour : period === "Day" ? dash.day : period === "Month" ? dash.month : period === "Year" ? dash.year : dash.week;
+  const historicalKey = `${period}:${periodOffset}`;
+  useEffect(() => {
+    if (periodOffset === 0) {
+      setHistoricalReport(null);
+      return;
+    }
+    let cancelled = false;
+    const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    const request = inTauri
+      ? invoke<PeriodReport>("get_period_report", { period, offset: periodOffset })
+      : Promise.resolve(currentReport);
+    request.then((report) => {
+      if (!cancelled) setHistoricalReport({ key: historicalKey, report });
+    }).catch((error) => console.error("failed to load historical period", error));
+    return () => { cancelled = true; };
+  }, [period, periodOffset, dash.generatedAt]);
+  const customKey = customRange ? `${customRange.startMs}:${customRange.endMs}` : "";
+  useEffect(() => {
+    if (!customRange) {
+      setCustomReport(null);
+      return;
+    }
+    let cancelled = false;
+    const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    const request = inTauri
+      ? invoke<PeriodReport>("get_range_report", { startMs: customRange.startMs, endMs: customRange.endMs })
+      : Promise.resolve(currentReport);
+    request.then((report) => {
+      if (!cancelled) setCustomReport({ key: customKey, report });
+    }).catch((error) => console.error("failed to load custom time range", error));
+    return () => { cancelled = true; };
+  }, [customKey, dash.generatedAt]);
+  const fixedReport: PeriodReport = periodOffset === 0
+    ? currentReport
+    : historicalReport?.key === historicalKey ? historicalReport.report : currentReport;
+  const P: PeriodReport = customRange
+    ? customReport?.key === customKey ? customReport.report : fixedReport
+    : fixedReport;
   const M = P.metrics;
   // animated Total tokens: counts up from 0 on each open / period switch;
   // held at 0 while the popover is hidden so it never flashes the final value.
-  const animTotal = useCountUp(M.totalTokens, `${period}:${openGen}`, active);
+  const animTotal = useCountUp(M.totalTokens, `${customKey || `${period}:${periodOffset}`}:${openGen}`, active || pinned);
   const models = P.models;
   // Hide noise: 0% token-share rows, and $0 entries in the cost donut.
   // Show models whose share is at least 0.1% when rounded to 1 decimal; below
@@ -424,30 +898,47 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
   const tokenShares = tokenModels.map(
     (m) => Math.round((m.tokens / (M.totalTokens || 1)) * 1000) / 10
   );
-  const trendSub = { Day: "today 24h", Week: "this week", Month: "this month" }[period];
+  const trendSub = customRange ? customRangeLabel(customRange) : periodDisplayLabel(period, periodOffset, dash.generatedAt);
+  const viewGeneratedAt = customRange
+    ? new Date(customRange.endMs).toISOString()
+    : periodViewEnd(period, periodOffset, dash.generatedAt).toISOString();
+  const fixedHeatmapMeta = {
+    Hour: { title: `${trendSub}热力图`, columns: 6, autoColumns: false, peakSub: "单个5分钟最高 Token" },
+    Day: { title: `${trendSub}小时热力图`, columns: 12, autoColumns: false, peakSub: "单小时最高 Token" },
+    Week: { title: `${trendSub}每日热力图`, columns: 7, autoColumns: false, peakSub: "单日最高 Token" },
+    Month: { title: `${trendSub}每日热力图`, columns: 7, autoColumns: true, peakSub: "单日最高 Token" },
+    Year: { title: `${trendSub}每月热力图`, columns: 6, autoColumns: false, peakSub: "单月最高 Token" },
+  }[period];
+  const heatmapMeta = customRange
+    ? { title: `${trendSub}分段热力图`, columns: 6, autoColumns: false, peakSub: "单分段最高 Token" }
+    : fixedHeatmapMeta;
+  const stagePeak = P.series.reduce((peak, point, index) => {
+    const tokens = point.input + point.cache + point.output;
+    return tokens > peak.tokens
+      ? { tokens, cost: P.costTrend[index] ?? 0 }
+      : peak;
+  }, { tokens: 0, cost: 0 });
   const primaryLimit = dash.rateLimits?.primary || null;
-  const secondaryLimit = dash.rateLimits?.secondary || null;
   const primaryRemaining = primaryLimit ? remainingPct(primaryLimit.usedPercent) : 0;
-  const secondaryRemaining = secondaryLimit ? remainingPct(secondaryLimit.usedPercent) : 0;
-  const quotaSub = primaryLimit
-    ? `${windowLabel(primaryLimit.windowMinutes)}${secondaryLimit ? ` · week ${Math.round(secondaryRemaining)}%` : ""}`
-    : dash.rateLimits?.planType || undefined;
-  const resetCredits = dash.rateLimits?.resetCreditsAvailable ?? null;
-  const resetCreditExpiry = dash.rateLimits?.resetCreditsExpiresAt ?? null;
-  const resetSub = resetCredits !== null
-    ? resetCredits > 0 && resetCreditExpiry
-      ? `expires ${resetCreditExpiryLabel(resetCreditExpiry)}`
-      : resetCredits > 0
-        ? "available now"
-        : "none available"
-    : undefined;
-  const globalTools = dash.profile?.topTools || [];
-  const globalToolRuns = dash.profile?.totalToolRuns || 0;
-  const globalToolUnique = dash.profile?.exploredTools || 0;
-
-  // screenshot capture: rasterize the full panel card to a PNG and hand it to
-  // the Rust `save_screenshot` command (browser preview falls back to a download).
-  const [shotBusy, setShotBusy] = useState(false);
+  const visibleBucketCount = customRange ? P.series.length : periodOffset === 0 ? activeBucketCount(period, dash.generatedAt) : P.series.length;
+  const requestTrendValues = P.reqTrend.slice(0, visibleBucketCount);
+  const costTrendValues = P.costTrend.slice(0, visibleBucketCount);
+  const sessionTrendValues = (P.sessionTrend || []).slice(0, visibleBucketCount);
+  const peakTrendValues = P.series.slice(0, visibleBucketCount).map((point) => point.input + point.cache + point.output);
+  const quotaPeriod = customRange ? customRangePeriod(customRange) : period;
+  const quotaTrendData = quotaPeriodTrend(dash.quotaTrend || [], quotaPeriod, viewGeneratedAt, visibleBucketCount, customRange?.startMs);
+  const quotaEfficiencyData = quotaEfficiency(dash.quotaTrend || [], quotaPeriod, viewGeneratedAt, customRange?.startMs);
+  const historicalQuotaAvailable = quotaTrendData.values.length > 0;
+  const isCurrentFixedPeriod = !customRange && periodOffset === 0;
+  const displayedRemaining = isCurrentFixedPeriod
+    ? primaryRemaining
+    : historicalQuotaAvailable ? quotaEfficiencyData.currentRemaining : null;
+  const quotaSparkValues = historicalQuotaAvailable ? quotaTrendData.values : isCurrentFixedPeriod ? [primaryRemaining] : [0, 0];
+  const quotaEfficiencyLabel = quotaEfficiencyData.averageCost != null
+    ? `1%均≈$${fmtPeakCost(quotaEfficiencyData.averageCost)}`
+    : quotaEfficiencyData.currentCost > 0
+      ? `当前1%·$${fmtPeakCost(quotaEfficiencyData.currentCost)}`
+      : "1%待累计";
   const [toast, setToast] = useState<{ msg: string; ok: boolean } | null>(null);
   const toastTimer = useRef<number | null>(null);
   const showToast = (msg: string, ok: boolean) => {
@@ -455,42 +946,17 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
     setToast({ msg, ok });
     toastTimer.current = window.setTimeout(() => setToast(null), 1800);
   };
-  const captureScreenshot = async () => {
-    if (shotBusy) return;
-    const el = document.querySelector<HTMLElement>(".om-scroll");
-    if (!el) { showToast("Nothing to capture", false); return; }
-    setShotBusy(true);
-    try {
-      // explicit width/height = full scrollable content, not just the viewport;
-      // filter drops the capture button itself (and its in-flight spinner) so
-      // the saved image is a clean dashboard, not a shot of the button.
-      const dataUrl = await domToPng(el, {
-        scale: 2,
-        backgroundColor: dark ? "#181818" : "#ffffff",
-        width: el.scrollWidth,
-        height: el.scrollHeight,
-        filter: (n) => !(n instanceof HTMLElement && n.getAttribute("aria-label") === "save screenshot"),
-      });
-      const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-      if (inTauri) {
-        await invoke<string>("save_screenshot", { dataUrl });
-        showToast("Saved to Desktop", true);
-      } else {
-        const a = document.createElement("a");
-        a.href = dataUrl;
-        a.download = "codexscope.png";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        showToast("Downloaded", true);
-      }
-    } catch {
-      showToast("Screenshot failed", false);
-    } finally {
-      setShotBusy(false);
-    }
+  const moveCustomRange = (direction: -1 | 1) => {
+    setDetailKind(null);
+    setCustomRange((range) => {
+      if (!range) return range;
+      const duration = range.endMs - range.startMs;
+      if (direction < 0) return { startMs: range.startMs - duration, endMs: range.endMs - duration };
+      const nextEnd = Math.min(Date.now(), range.endMs + duration);
+      return { startMs: nextEnd - duration, endMs: nextEnd };
+    });
   };
-
+  const customForwardDisabled = !!customRange && customRange.endMs >= Date.now() - 60_000;
   return (
     <div style={{
       width: "100%", height: "100vh", overflow: "hidden", boxSizing: "border-box",
@@ -518,14 +984,14 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
         } : undefined}
         onMouseUp={canDrag ? () => { dragRef.current = null; } : undefined}
         style={{
-        width: "100%", height: "100%", overflowY: "auto",
+        width: "100%", height: "100%", overflow: "hidden", display: "flex", flexDirection: "column",
         borderRadius: 12, background: dark ? "#181818" : "#ffffff",
         border: `1px solid ${dark ? "rgba(255,255,255,0.10)" : "rgba(0,0,0,0.08)"}`,
         padding: 0, color: t.text, cursor: canDrag ? "grab" : undefined,
       }}>
-        {/* sticky header — stays put while the body scrolls */}
+        {/* fixed header */}
         <div style={{
-          position: "sticky", top: 0, zIndex: 10,
+          position: "relative", zIndex: 10, flex: "0 0 auto",
           display: "flex", alignItems: "center", justifyContent: "space-between",
           padding: "15px 15px 12px",
           background: dark ? "#181818" : "#ffffff",
@@ -535,26 +1001,37 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
             <TokenGlyph color={t.accent} size={16} />
             <span style={{ font: `600 13px ${t.ui}`, color: t.text, letterSpacing: ".01em" }}>CodexScope</span>
           </div>
-          <div data-no-drag="" style={{ display: "flex", alignItems: "center", gap: 8, cursor: "default" }}>
-            <Segmented value={period} theme={t} onSelect={(v) => setPeriod(v as any)} />
+          <div data-no-drag="" style={{ display: "flex", alignItems: "center", gap: 7, cursor: "default" }}>
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
+              <button onClick={() => customRange ? moveCustomRange(-1) : (setDetailKind(null), setPeriodOffset((value) => Math.max(minimumPeriodOffset(period), value - 1)))}
+                title={customRange ? "查看前一等长时间段" : `查看更早的${{ Hour: "小时", Day: "一天", Week: "一周", Month: "一月", Year: "一年" }[period]}`} aria-label="查看上一阶段"
+                style={{ width: 18, height: 25, padding: 0, border: 0, borderRadius: 5, background: t.segBg, color: t.segOffText, cursor: "pointer", font: `700 15px ${t.ui}` }}>‹</button>
+              <Segmented value={customRange ? "" : period} theme={t} onSelect={(v) => { setCustomRange(null); setPeriod(v as PeriodKind); setPeriodOffset(0); setDetailKind(null); }} />
+              <button disabled={customRange ? customForwardDisabled : periodOffset === 0}
+                onClick={() => customRange ? moveCustomRange(1) : (setDetailKind(null), setPeriodOffset((value) => Math.min(0, value + 1)))}
+                title={customRange ? customForwardDisabled ? "已经到当前时间" : "查看后一等长时间段" : periodOffset === 0 ? "已经是当前阶段" : "查看下一阶段"} aria-label="查看下一阶段"
+                style={{ width: 18, height: 25, padding: 0, border: 0, borderRadius: 5, background: t.segBg,
+                  color: (customRange ? customForwardDisabled : periodOffset === 0) ? t.faint : t.segOffText,
+                  opacity: (customRange ? customForwardDisabled : periodOffset === 0) ? 0.45 : 1,
+                  cursor: (customRange ? customForwardDisabled : periodOffset === 0) ? "default" : "pointer", font: `700 15px ${t.ui}` }}>›</button>
+            </div>
             <ThemeToggle pref={themePref} theme={t} onCycle={onToggleTheme} />
-            <ScreenshotButton theme={t} busy={shotBusy} onClick={captureScreenshot} />
-            <AppMenuButton theme={t} onRefresh={onRefresh} showToast={showToast} />
+            <AppMenuButton theme={t} onRefresh={onRefresh} onCustomRange={() => { setDetailKind(null); setRangePickerOpen(true); }} showToast={showToast} pinned={pinned} onPinnedChange={setPinned} />
           </div>
         </div>
-        {/* scrolling body */}
-        <div style={{ padding: "14px 15px 15px" }}>
+        {/* single-page body; the heatmap consumes the remaining height */}
+        <div style={{ padding: "12px 15px 14px", flex: "1 1 auto", minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
         {/* hero */}
         <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 10 }}>
           <div>
-            <div style={{ font: `500 10px ${t.ui}`, color: t.dim, letterSpacing: ".04em", textTransform: "uppercase" }}>Total tokens</div>
+            <div style={{ font: `500 10px ${t.ui}`, color: t.dim, letterSpacing: ".04em" }}>Token 总量 · {trendSub}</div>
             <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 3 }}>
-              <span style={{ font: `600 30px ${t.mono}`, color: t.text, letterSpacing: "-.01em" }}>{animTotal.toFixed(2)}<span style={{ font: `500 15px ${t.mono}`, color: t.dim, marginLeft: 2 }}>M</span></span>
+              <span style={{ font: `600 30px ${t.mono}`, color: t.text, letterSpacing: "-.01em" }}>{animTotal >= 1000 ? (animTotal / 1000).toFixed(2) : animTotal.toFixed(2)}<span style={{ font: `500 15px ${t.mono}`, color: t.dim, marginLeft: 2 }}>{animTotal >= 1000 ? "B" : "M"}</span></span>
               {Math.round(M.deltaTokens) !== 0 && <Delta v={M.deltaTokens} theme={t} />}
             </div>
           </div>
           <div style={{ textAlign: "right" }}>
-            <div style={{ font: `500 10px ${t.ui}`, color: t.dim }}>Est. API value</div>
+            <div style={{ font: `500 10px ${t.ui}`, color: t.dim }}>预估 API 等值费用</div>
             <div style={{ font: `600 18px ${t.mono}`, color: t.accent, marginTop: 2 }}>${M.cost.toFixed(2)}</div>
           </div>
         </div>
@@ -572,76 +1049,69 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
         <BarChart data={P.series} theme={t} height={84} />
         <SectionRule t={t} m="14px 0 10px" />
         {/* models */}
-        <div style={{ marginBottom: 4 }}><Label t={t}>Tokens by model</Label></div>
-        {tokenModels.length === 0 && <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint, padding: "4px 0" }}>No usage in this period</div>}
+        <div style={{ marginBottom: 4 }}><Label t={t}>各模型 Token</Label></div>
+        {tokenModels.length === 0 && <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint, padding: "4px 0" }}>此周期暂无用量</div>}
         {tokenModels.map((m, i) => <ModelRow key={i} m={m} max={maxM} theme={t} share={tokenShares[i]} />)}
         <SectionRule t={t} m="10px 0 10px" />
         {/* estimated API value donut */}
-        <div style={{ marginBottom: 8 }}><Label t={t}>API value by model</Label></div>
+        <div style={{ marginBottom: 8 }}><Label t={t}>各模型 API 等值费用</Label></div>
         {costModels.length > 0
           ? <CostDonut models={costModels} theme={t} size={100} thickness={15} />
           : <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint }}>—</div>}
         {unpricedModels.length > 0 && (
           <div style={{ marginTop: 9, font: `500 9.5px/1.5 ${t.mono}`, color: t.faint }}>
-            {unpricedModels.length} model{unpricedModels.length > 1 ? "s" : ""} without pricing data (value not counted):{" "}
+            {unpricedModels.length} 个模型缺少价格数据（未计入费用）：{" "}
             <span style={{ color: t.dim }}>{unpricedModels.map((m) => m.name).join(", ")}</span>
           </div>
         )}
         <SectionRule t={t} m="12px 0 12px" />
         {/* footer stats */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-          <MiniStat label="Responses" value={fmtInt(M.requests)} sub={`${M.sessions} threads`} theme={t}>
-            <Sparkline values={P.reqTrend.length ? P.reqTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
+          <MiniStat label="响应次数" value={fmtInt(M.requests)} sub={`${M.sessions} 个会话`} theme={t}
+            onClick={() => setDetailKind("requests")}>
+            <Sparkline values={requestTrendValues.length ? requestTrendValues : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
           </MiniStat>
-          <MiniStat label="API value" value={`$${M.cost.toFixed(2)}`} sub={trendSub} theme={t} accent={t.accent}>
-            <Sparkline values={P.costTrend.length ? P.costTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
+          <MiniStat label="API 等值费用" value={`$${M.cost.toFixed(2)}`} sub={trendSub} theme={t} accent={t.accent}
+            onClick={() => setDetailKind("cost")}>
+            <Sparkline values={costTrendValues.length ? costTrendValues : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
           </MiniStat>
           {primaryLimit && (
-            <MiniStat label="Usage left" value={`${Math.round(primaryRemaining)}%`} sub={quotaSub} theme={t} accent={primaryRemaining <= 20 ? "#e0795f" : t.accent} />
+            <MiniStat label={`剩余额度 · ${!isCurrentFixedPeriod && !historicalQuotaAvailable ? "无历史额度" : quotaEfficiencyLabel}`} value={displayedRemaining == null ? "—" : `${Math.round(displayedRemaining)}%`} sub={trendSub} theme={t} accent={(displayedRemaining ?? 100) <= 20 ? "#e0795f" : t.accent}
+              onClick={() => setDetailKind("quota")}>
+              <Sparkline values={quotaSparkValues} theme={t} width={52} height={20} accent={(displayedRemaining ?? 100) <= 20 ? "#e0795f" : t.accent} />
+            </MiniStat>
           )}
-          {resetCredits !== null && (
-            <MiniStat label="Resets" value={fmtInt(resetCredits)} sub={resetSub} theme={t} accent={t.accent} />
-          )}
+          <MiniStat label="会话数" value={fmtInt(M.sessions)} sub={trendSub} theme={t} accent={t.accent}
+            onClick={() => setDetailKind("sessions")}>
+            <Sparkline values={sessionTrendValues.length ? sessionTrendValues : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
+          </MiniStat>
+          {dash.profile && <>
+            <MiniStat label="累计 Token" value={fmtProfileTokens(dash.profile.cumulativeTokens)} sub={dash.profile.source === "account" ? "账户累计" : "本地日志"} theme={t} />
+            <MiniStat label="阶段峰值" labelExtra={<span data-no-drag="" style={{ display: "inline-flex", padding: 1, borderRadius: 4, background: t.segBg, border: `1px solid ${t.segBorder}` }}>
+                {(["tokens", "cost"] as const).map((unit) => <button key={unit} onClick={(event) => { event.stopPropagation(); setPeakUnit(unit); }}
+                  aria-label={unit === "tokens" ? "显示 Token 峰值" : "显示费用峰值"}
+                  style={{ border: 0, borderRadius: 3, padding: "1px 4px", cursor: "pointer", background: peakUnit === unit ? t.segOnBg : "transparent",
+                    color: peakUnit === unit ? t.segOnText : t.segOffText, font: `600 8px ${t.mono}` }}>{unit === "tokens" ? "M" : "$"}</button>)}
+              </span>} value={peakUnit === "tokens" ? fmtPeakTokens(stagePeak.tokens) : `$${fmtPeakCost(stagePeak.cost)}`}
+              sub={heatmapMeta.peakSub} theme={t} accent={t.accent}
+              onClick={() => setDetailKind("peak")}>
+              <Sparkline values={(peakUnit === "tokens" ? peakTrendValues : costTrendValues).length ? (peakUnit === "tokens" ? peakTrendValues : costTrendValues) : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
+            </MiniStat>
+          </>}
         </div>
-        {/* Profile-like lifetime stats from retained Codex logs */}
-        {dash.profile && (
-          <>
-            <SectionRule t={t} />
-            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 8 }}>
-              <Label t={t}>Profile stats</Label>
-              <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}>
-                {dash.profile.source === "account" ? "account usage" : "retained logs"}
-              </span>
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-              <MiniStat label="All tokens" value={fmtProfileTokens(dash.profile.cumulativeTokens)} sub={dash.profile.source === "account" ? "account lifetime" : "retained logs"} theme={t} />
-              <MiniStat label="Peak day" value={fmtProfileTokens(dash.profile.peakDayTokens)} sub="max tokens/day" theme={t} accent={t.accent} />
-              <MiniStat label="Longest thread" value={durationLabel(dash.profile.longestTaskMinutes)} sub="observed span" theme={t} />
-              <MiniStat label="Streak" value={`${dash.profile.currentStreakDays}d`} sub={`best ${dash.profile.longestStreakDays}d`} theme={t} />
-              <MiniStat label="Top effort" value={effortLabel(dash.profile.topEffort)} sub={dash.profile.topEffort ? `${Math.round(dash.profile.lowEffortPercent)}% quick-mode` : "not in logs"} theme={t} />
-              <MiniStat label="Threads" value={fmtInt(dash.profile.totalSessions)} sub={`${fmtInt(dash.profile.totalToolRuns)} tool runs`} theme={t} />
-            </div>
-            {dash.profile.topTools.length > 0 && (
-              <>
-                <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", margin: "10px 0 7px" }}>
-                  <Label t={t}>Tool calls</Label>
-                  <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}><span style={{ color: t.text, fontWeight: 600 }}>{fmtInt(globalToolRuns)}</span> · {fmtInt(globalToolUnique)} unique</span>
-                </div>
-                <BarList items={globalTools} theme={t} accent={t.accent} />
-              </>
-            )}
-          </>
-        )}
         {/* heatmap */}
-        <SectionRule t={t} />
-        <div style={{ marginBottom: 9 }}><Label t={t}>Daily activity</Label></div>
-        <Heatmap days={dash.heatmap} theme={t} accent={t.accent} />
-        {/* footer note */}
-        <div style={{ marginTop: 12, font: `500 8.5px ${t.mono}`, color: t.faint, textAlign: "center" }}>
-          Est. API value via OpenAI API prices, then models.dev / LiteLLM · ChatGPT subscription billing may differ
+        <SectionRule t={t} m="10px 0 9px" />
+        <div style={{ flex: "1 1 0", minHeight: 0 }}>
+          <Heatmap data={P.series} columns={heatmapMeta.columns} autoColumns={heatmapMeta.autoColumns} title={heatmapMeta.title} theme={t} accent={t.accent} />
         </div>
-        </div>{/* /scrolling body */}
+        </div>{/* /single-page body */}
       </div>
+      {detailKind && <TrendOverlay kind={detailKind} report={P} quotaTrendData={quotaTrendData} quotaEfficiencyData={quotaEfficiencyData} peakUnit={peakUnit} bucketCount={visibleBucketCount} periodLabel={trendSub} theme={t} onClose={() => setDetailKind(null)} />}
+      {rangePickerOpen && <CustomRangeOverlay
+        initialRange={customRange || { startMs: Date.now() - 24 * 60 * 60 * 1000, endMs: Date.now() }}
+        theme={t}
+        onClose={() => setRangePickerOpen(false)}
+        onApply={(range) => { setCustomRange(range); setRangePickerOpen(false); setDetailKind(null); }} />}
       {toast && (
         <div className="om-toast" style={{
           position: "absolute", top: 58, left: "50%", transform: "translateX(-50%)",
@@ -658,7 +1128,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
   );
 }
 
-export default function App() {
+function MainApp() {
   const [dash, setDash] = useState<Dashboard | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [openGen, setOpenGen] = useState(0);
@@ -768,22 +1238,117 @@ export default function App() {
 
   const t = TH[dark ? "dark" : "light"];
   if (err) {
-    return <div style={{ padding: 20, font: `500 12px ${t.mono}`, color: "#e0795f" }}>Failed to load: {err}</div>;
+    return <div style={{ padding: 20, font: `500 12px ${t.mono}`, color: "#e0795f" }}>加载失败：{err}</div>;
   }
   if (!dash) {
     return (
       <div style={{ height: "100vh", padding: 10, boxSizing: "border-box", background: "transparent" }}>
         <div style={{ height: "100%", borderRadius: 14, background: dark ? "#181818" : "#ffffff",
           display: "flex", alignItems: "center", justifyContent: "center",
-          font: `500 12px ${t.mono}`, color: t.dim }}>Loading…</div>
+          font: `500 12px ${t.mono}`, color: t.dim }}>正在加载…</div>
       </div>
     );
   }
   const refreshDashboard = async () => {
-    const d = await fetchDashboard();
+    const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    const d = inTauri ? await invoke<Dashboard>("refresh_dashboard") : await fetchDashboard();
     setDash(d);
     setErr(null);
   };
 
   return <Panel dash={dash} dark={dark} themePref={themePref} onToggleTheme={cycleTheme} onRefresh={refreshDashboard} openGen={openGen} active={focused} />;
+}
+
+type TrendPeriod = "Hour" | "Day" | "Week" | "Month";
+
+function periodReport(dash: Dashboard, period: TrendPeriod): PeriodReport {
+  return period === "Hour" ? dash.hour : period === "Day" ? dash.day : period === "Month" ? dash.month : dash.week;
+}
+
+function TrendWindow({ kind, period }: { kind: "requests" | "cost"; period: TrendPeriod }) {
+  const [dash, setDash] = useState<Dashboard | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [dark, setDark] = useState(() => {
+    const saved = localStorage.getItem("codexscope-theme");
+    if (saved === "dark") return true;
+    if (saved === "light") return false;
+    return !!window.matchMedia?.("(prefers-color-scheme: dark)").matches;
+  });
+
+  useEffect(() => {
+    fetchDashboard().then(setDash).catch((e) => setErr(String(e)));
+    let dead = false;
+    let unlisten: (() => void) | undefined;
+    listen<Dashboard>("dashboard-updated", (e) => setDash(e.payload)).then((u) => dead ? u() : (unlisten = u));
+    const mq = window.matchMedia?.("(prefers-color-scheme: dark)");
+    const onTheme = (e: MediaQueryListEvent) => {
+      if (localStorage.getItem("codexscope-theme") === "system") setDark(e.matches);
+    };
+    mq?.addEventListener("change", onTheme);
+    return () => { dead = true; unlisten?.(); mq?.removeEventListener("change", onTheme); };
+  }, []);
+
+  const t = TH[dark ? "dark" : "light"];
+  useEffect(() => {
+    document.body.style.background = t.card;
+    document.documentElement.style.background = t.card;
+  }, [t.card]);
+
+  if (err) return <div style={{ padding: 24, font: `500 13px ${t.mono}`, color: "#e0795f" }}>加载失败：{err}</div>;
+  if (!dash) return <div style={{ height: "100vh", display: "grid", placeItems: "center", background: t.card, font: `500 13px ${t.mono}`, color: t.dim }}>正在加载详细趋势…</div>;
+
+  const P = periodReport(dash, period);
+  const values = kind === "requests" ? P.reqTrend : P.costTrend;
+  const labels = P.series.map((s) => s.full);
+  const total = values.reduce((s, v) => s + v, 0);
+  const average = values.length ? total / values.length : 0;
+  const peak = Math.max(...values, 0);
+  const peakIndex = values.indexOf(peak);
+  const activeBuckets = values.filter((v) => v > 0).length;
+  const periodName = { Hour: "最近60分钟", Day: "今天", Week: "本周", Month: "本月" }[period];
+  const title = kind === "requests" ? "响应次数详细趋势" : "API 等值费用详细趋势";
+  const unitName = kind === "requests" ? "次" : "美元";
+  const formatValue = kind === "requests"
+    ? (v: number) => `${fmtInt(Math.round(v))} 次`
+    : (v: number) => v > 0 && v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`;
+  const max = Math.max(...values, 1e-9);
+
+  const summary = [
+    { label: "总计", value: formatValue(total), sub: periodName },
+    { label: "平均每区间", value: formatValue(average), sub: `${values.length} 个统计区间` },
+    { label: "峰值", value: formatValue(peak), sub: labels[peakIndex] || "—" },
+    { label: "活跃区间", value: `${activeBuckets} / ${values.length}`, sub: `单位：${unitName}` },
+  ];
+
+  return (
+    <div style={{ minHeight: "100vh", boxSizing: "border-box", padding: "24px 28px 30px", background: t.card, color: t.text, fontFamily: t.ui }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 16, marginBottom: 18 }}>
+        <div>
+          <div style={{ font: `700 22px ${t.display}`, color: t.text }}>{title}</div>
+          <div style={{ marginTop: 5, font: `500 11px ${t.mono}`, color: t.dim }}>{periodName} · 数据每30秒自动更新</div>
+        </div>
+        <div style={{ font: `600 12px ${t.mono}`, color: t.accent }}>CodexScope</div>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginBottom: 14 }}>
+        {summary.map((s) => <div key={s.label} style={{ padding: "12px 14px", borderRadius: 11, background: t.segBg, border: `1px solid ${t.segBorder}` }}>
+          <div style={{ font: `500 10px ${t.ui}`, color: t.dim }}>{s.label}</div>
+          <div style={{ marginTop: 5, font: `700 18px ${t.mono}`, color: t.text }}>{s.value}</div>
+          <div style={{ marginTop: 4, font: `500 9px ${t.mono}`, color: t.faint, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.sub}</div>
+        </div>)}
+      </div>
+      <TrendDetail title={`${title} · ${periodName}`} values={values} labels={labels} theme={t} accent={t.accent} formatValue={formatValue} />
+      <div style={{ marginTop: 16, font: `600 13px ${t.ui}`, color: t.text }}>分时明细</div>
+      <div style={{ marginTop: 8, borderRadius: 11, overflow: "hidden", border: `1px solid ${t.segBorder}` }}>
+        {P.series.map((point, i) => <div key={i} style={{ display: "grid", gridTemplateColumns: "180px 1fr 100px", alignItems: "center", gap: 14, padding: "9px 12px", background: i % 2 ? t.segBg : "transparent", borderTop: i ? `1px solid ${t.gridLine}` : undefined }}>
+          <span style={{ font: `500 10px ${t.mono}`, color: t.dim }}>{point.full}</span>
+          <span style={{ height: 7, borderRadius: 4, background: t.gridLine, overflow: "hidden" }}><span style={{ display: "block", width: `${values[i] > 0 ? Math.max(1, values[i] / max * 100) : 0}%`, height: "100%", borderRadius: 4, background: t.accent }} /></span>
+          <span style={{ font: `600 10px ${t.mono}`, color: values[i] > 0 ? t.text : t.faint, textAlign: "right" }}>{formatValue(values[i] || 0)}</span>
+        </div>)}
+      </div>
+    </div>
+  );
+}
+
+export default function App() {
+  return <MainApp />;
 }
