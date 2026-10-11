@@ -31,6 +31,13 @@ pub struct ModelPrice {
     pub output: f64,       // per-token USD
     pub cache_create: f64, // per-token USD
     pub cache_read: f64,   // per-token USD
+    // Some models charge a higher rate when the complete input context for a
+    // request crosses a threshold. Zero means the model has no tiered rate.
+    pub long_context_threshold: f64,
+    pub long_input: f64,
+    pub long_output: f64,
+    pub long_cache_create: f64,
+    pub long_cache_read: f64,
 }
 
 impl ModelPrice {
@@ -233,6 +240,7 @@ impl Pricing {
                     output: g("output") / 1e6,
                     cache_create: g("cache_write") / 1e6,
                     cache_read: g("cache_read") / 1e6,
+                    ..Default::default()
                 };
                 entries.push((id.clone(), price));
             }
@@ -258,6 +266,7 @@ impl Pricing {
                 output: g("output_cost_per_token"),
                 cache_create: g("cache_creation_input_token_cost"),
                 cache_read: g("cache_read_input_token_cost"),
+                ..Default::default()
             };
             entries.push((id.clone(), price));
         }
@@ -275,8 +284,26 @@ impl Pricing {
             output: o,
             cache_create: cc,
             cache_read: cr,
+            ..Default::default()
+        };
+        let tiered = |i: f64, o: f64, cc: f64, cr: f64| ModelPrice {
+            input: i,
+            output: o,
+            cache_create: cc,
+            cache_read: cr,
+            long_context_threshold: 272_000.0,
+            long_input: i * 2.0,
+            long_output: o * 1.5,
+            long_cache_create: cc * 2.0,
+            long_cache_read: cr * 2.0,
         };
         let b: &[(&str, ModelPrice)] = &[
+            ("gpt-6-astra", tiered(10e-6, 50e-6, 12.5e-6, 1e-6)),
+            ("gpt-6.1-sol", tiered(2e-6, 10e-6, 2.5e-6, 0.1e-6)),
+            ("gpt-6-sol", tiered(2e-6, 10e-6, 2.5e-6, 0.2e-6)),
+            ("gpt-6-luna", tiered(0.1e-6, 0.5e-6, 0.125e-6, 0.01e-6)),
+            ("gpt-5.6", mk(5e-6, 30e-6, 0.0, 0.5e-6)),
+            ("gpt-5.6-sol", mk(5e-6, 30e-6, 0.0, 0.5e-6)),
             ("gpt-5.5", mk(5e-6, 30e-6, 0.0, 0.5e-6)),
             ("gpt-5.5-2026-04-23", mk(5e-6, 30e-6, 0.0, 0.5e-6)),
             ("gpt-5.4", mk(2.5e-6, 15e-6, 0.0, 0.25e-6)),
@@ -305,6 +332,7 @@ impl Pricing {
             output: o,
             cache_create: cc,
             cache_read: cr,
+            ..Default::default()
         };
         let b: &[(&str, ModelPrice)] = &[
             ("claude-opus-4-7", mk(5e-6, 25e-6, 6.25e-6, 0.5e-6)),
@@ -335,11 +363,23 @@ impl Pricing {
         cache_read: f64,
     ) -> Option<f64> {
         let p = self.lookup(model)?;
+        let long_context = p.long_context_threshold > 0.0
+            && input + cache_create + cache_read > p.long_context_threshold;
+        let (input_rate, output_rate, cache_create_rate, cache_read_rate) = if long_context {
+            (
+                p.long_input,
+                p.long_output,
+                p.long_cache_create,
+                p.long_cache_read,
+            )
+        } else {
+            (p.input, p.output, p.cache_create, p.cache_read)
+        };
         Some(
-            input * p.input
-                + output * p.output
-                + cache_create * p.cache_create
-                + cache_read * p.cache_read,
+            input * input_rate
+                + output * output_rate
+                + cache_create * cache_create_rate
+                + cache_read * cache_read_rate,
         )
     }
 
@@ -356,6 +396,54 @@ mod tests {
     #[test]
     fn builtin_prices_openai_official_models_without_network() {
         let pricing = Pricing::builtin_only();
+
+        let astra_standard = pricing
+            .cost("gpt-6-astra", 100_000.0, 100_000.0, 0.0, 100_000.0)
+            .unwrap();
+        assert!((astra_standard - 6.1).abs() < 1e-9);
+
+        let astra_long = pricing
+            .cost("gpt-6-astra", 100_000.0, 100_000.0, 0.0, 200_000.0)
+            .unwrap();
+        assert!((astra_long - 9.9).abs() < 1e-9);
+
+        let sol61_standard = pricing
+            .cost("gpt-6.1-sol", 100_000.0, 100_000.0, 0.0, 100_000.0)
+            .unwrap();
+        assert!((sol61_standard - 1.21).abs() < 1e-9);
+        let sol61_long = pricing
+            .cost("gpt-6.1-sol", 100_000.0, 100_000.0, 0.0, 200_000.0)
+            .unwrap();
+        assert!((sol61_long - 1.94).abs() < 1e-9);
+
+        let sol6_standard = pricing
+            .cost("gpt-6-sol", 100_000.0, 100_000.0, 0.0, 100_000.0)
+            .unwrap();
+        assert!((sol6_standard - 1.22).abs() < 1e-9);
+        let sol6_long = pricing
+            .cost("gpt-6-sol", 100_000.0, 100_000.0, 0.0, 200_000.0)
+            .unwrap();
+        assert!((sol6_long - 1.98).abs() < 1e-9);
+
+        let luna_standard = pricing
+            .cost("gpt-6-luna", 100_000.0, 100_000.0, 0.0, 100_000.0)
+            .unwrap();
+        assert!((luna_standard - 0.061).abs() < 1e-9);
+        let luna_long = pricing
+            .cost("gpt-6-luna", 100_000.0, 100_000.0, 0.0, 200_000.0)
+            .unwrap();
+        assert!((luna_long - 0.099).abs() < 1e-9);
+
+        let sol = pricing
+            .cost(
+                "gpt-5.6-sol",
+                1_000_000.0,
+                1_000_000.0,
+                0.0,
+                1_000_000.0,
+            )
+            .unwrap();
+        assert!((sol - 35.5).abs() < 1e-9);
 
         let gpt55 = pricing
             .cost("gpt-5.5", 1_000_000.0, 1_000_000.0, 0.0, 1_000_000.0)
