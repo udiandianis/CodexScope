@@ -1,6 +1,6 @@
 {
   "name": "codexscope",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Menu-bar dashboard for local Codex token usage, API-value estimates, rate limits, and tool-call activity.",
   "license": "MIT",
   "author": "poer2023",
