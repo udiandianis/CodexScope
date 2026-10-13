@@ -119,6 +119,24 @@ function MiniStat({ label, labelExtra, value, sub, theme, accent, children, onCl
 type TrendKind = "requests" | "cost" | "quota" | "sessions" | "peak";
 type PeriodKind = "Hour" | "Day" | "Week" | "Month" | "Year";
 type CustomRange = { startMs: number; endMs: number };
+type LoadedReport = { key: string; report: PeriodReport };
+
+const EMPTY_REPORT: PeriodReport = {
+  metrics: { totalTokens: 0, inputTokens: 0, cacheTokens: 0, outputTokens: 0, cost: 0,
+    toolCalls: 0, requests: 0, sessions: 0, deltaTokens: 0, deltaCost: 0, uniqueTools: 0 },
+  series: [], models: [], tools: [], reqTrend: [], costTrend: [], sessionTrend: [],
+};
+
+function selectPeriodReport(current: PeriodReport, key: string | null, loaded: LoadedReport | null): PeriodReport | null {
+  return key == null ? current : loaded?.key === key ? loaded.report : null;
+}
+
+function reportPeaks(report: PeriodReport, bucketCount: number) {
+  return {
+    tokens: Math.max(0, ...report.series.slice(0, bucketCount).map((point) => point.input + point.cache + point.output)),
+    cost: Math.max(0, ...report.costTrend.slice(0, bucketCount)),
+  };
+}
 
 function toLocalDateTimeInput(timestampMs: number) {
   const date = new Date(timestampMs);
@@ -226,11 +244,11 @@ function quotaEfficiency(points: Dashboard["quotaTrend"], period: PeriodKind, ge
   const periodStart = explicitStartMs ?? periodStartMs(period, now);
   const sorted = [...points].filter((point) => point.timestampMs <= now.getTime()).sort((a, b) => a.timestampMs - b.timestampMs);
   const latestPoint = sorted[sorted.length - 1];
-  const currentRemaining = latestPoint?.remainingPercent ?? 0;
+  const currentRemaining = latestPoint && latestPoint.timestampMs >= periodStart ? latestPoint.remainingPercent : null;
   const empty = { averageTokens: null, averageCost: null, lastCompletedTokens: null, lastCompletedCost: null,
     currentTokens: 0, currentCost: 0, completedPercent: 0, segmentCosts: [] as number[], segmentLabels: [] as string[],
     currentRemaining };
-  if (sorted.length < 2) return empty;
+  if (sorted.length < 2 || currentRemaining == null) return empty;
 
   let segmentStart = sorted[0];
   let completedTokens = 0;
@@ -296,12 +314,46 @@ function quotaPeriodTrend(points: Dashboard["quotaTrend"], period: PeriodKind, g
   const now = new Date(generatedAt);
   const nowMs = now.getTime();
   const sorted = [...points].filter((point) => point.timestampMs <= nowMs).sort((a, b) => a.timestampMs - b.timestampMs);
-  if (!sorted.length || count <= 0) return { values: [] as number[], labels: [] as string[], annotations: [] as string[] };
+  if (!sorted.length || count <= 0) return { values: [] as Array<number | null>, labels: [] as string[], annotations: [] as string[] };
   const requestedStart = explicitStartMs ?? periodStartMs(period, now);
-  const beforeStart = [...sorted].reverse().find((point) => point.timestampMs <= requestedStart);
-  const firstInside = sorted.find((point) => point.timestampMs >= requestedStart);
-  const baseline = beforeStart || firstInside || sorted[0];
-  const startMs = beforeStart ? requestedStart : baseline.timestampMs;
+
+  // Match the quota nodes to the same real buckets used by the other trend
+  // charts. In particular, seven weekly nodes mean seven calendar days, not
+  // seven evenly-spaced points from Monday 00:00 to Sunday 23:59.
+  const windows: Array<{ startMs: number; endMs: number }> = [];
+  if (explicitStartMs != null) {
+    const width = Math.max(1, (nowMs - requestedStart) / count);
+    for (let i = 0; i < count; i++) {
+      windows.push({
+        startMs: requestedStart + width * i,
+        endMs: i === count - 1 ? nowMs : requestedStart + width * (i + 1) - 1,
+      });
+    }
+  } else if (period === "Hour") {
+    const width = 60 * 60 * 1000 / count;
+    for (let i = 0; i < count; i++) {
+      windows.push({
+        startMs: requestedStart + width * i,
+        endMs: i === count - 1 ? nowMs : requestedStart + width * (i + 1) - 1,
+      });
+    }
+  } else if (period === "Year") {
+    const year = now.getFullYear();
+    for (let i = 0; i < count; i++) {
+      windows.push({
+        startMs: new Date(year, i, 1).getTime(),
+        endMs: Math.min(nowMs, new Date(year, i + 1, 1).getTime() - 1),
+      });
+    }
+  } else {
+    const width = period === "Day" ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+    for (let i = 0; i < count; i++) {
+      windows.push({
+        startMs: requestedStart + width * i,
+        endMs: Math.min(nowMs, requestedStart + width * (i + 1) - 1),
+      });
+    }
+  }
 
   const boundaries: Array<{ timestampMs: number; drop: number; cost: number }> = [];
   let segmentStart = sorted[0];
@@ -320,24 +372,42 @@ function quotaPeriodTrend(points: Dashboard["quotaTrend"], period: PeriodKind, g
     segmentStart = current;
   }
 
-  const values: number[] = [];
-  const labels: string[] = [];
-  const annotations: string[] = [];
-  let previousTarget = startMs - 1;
-  for (let i = 0; i < count; i++) {
-    const target = count === 1 ? nowMs : startMs + ((nowMs - startMs) * i) / (count - 1);
-    let latest = baseline;
+  // Quota is a state, so every state curve needs the value at the left-hand
+  // boundary before the per-bucket closing values. Only accept a nearby real
+  // sample; an old cached value is not evidence of the quota at the boundary.
+  const boundaryTolerance = explicitStartMs != null
+    ? Math.min(Math.max(1, windows[0]?.endMs - windows[0]?.startMs + 1), 2 * 60 * 60 * 1000)
+    : period === "Hour" ? 10 * 60 * 1000
+      : period === "Year" ? 48 * 60 * 60 * 1000
+        : 2 * 60 * 60 * 1000;
+  const boundarySample = [...sorted].reverse().find((point) =>
+    point.timestampMs <= requestedStart && requestedStart - point.timestampMs <= boundaryTolerance
+  );
+  const values: Array<number | null> = [boundarySample?.remainingPercent ?? null];
+  const labels: string[] = [quotaSampleLabel(requestedStart, period)];
+  const annotations: string[] = [boundarySample ? "阶段起点" : "阶段起点无额度样本"];
+  for (const window of windows) {
+    const target = window.endMs;
+    let latest: Dashboard["quotaTrend"][number] | null = null;
     let activeStart = sorted[0];
     for (let j = 0; j < sorted.length; j++) {
       const point = sorted[j];
       if (point.timestampMs > target) break;
-      latest = point;
       if (j > 0) {
         const previous = sorted[j - 1];
         if (point.remainingPercent !== previous.remainingPercent) activeStart = point;
       }
+      if (point.timestampMs >= window.startMs) latest = point;
     }
-    const completed = boundaries.filter((boundary) => boundary.timestampMs > previousTarget && boundary.timestampMs <= target);
+    labels.push(quotaSampleLabel(target, period));
+    if (!latest) {
+      // Quota history only exists while CodexScope is running. Carrying a
+      // sample across an empty day would invent a flat historical value.
+      values.push(null);
+      annotations.push("本区间无额度样本");
+      continue;
+    }
+    const completed = boundaries.filter((boundary) => boundary.timestampMs >= window.startMs && boundary.timestampMs <= target);
     if (completed.length) {
       const completedPercent = completed.reduce((sum, boundary) => sum + boundary.drop, 0);
       const completedCost = completed.reduce((sum, boundary) => sum + boundary.cost, 0);
@@ -350,14 +420,12 @@ function quotaPeriodTrend(points: Dashboard["quotaTrend"], period: PeriodKind, g
       annotations.push(`当前 1% 累计 $${fmtPeakCost(currentCost)}`);
     }
     values.push(latest.remainingPercent);
-    labels.push(quotaSampleLabel(target, period));
-    previousTarget = target;
   }
   return { values, labels, annotations };
 }
 
-function TrendOverlay({ kind, report, quotaTrendData, quotaEfficiencyData, peakUnit, bucketCount, periodLabel, theme, onClose }:
-  { kind: TrendKind; report: PeriodReport; quotaTrendData: ReturnType<typeof quotaPeriodTrend>; quotaEfficiencyData: ReturnType<typeof quotaEfficiency>; peakUnit: "tokens" | "cost"; bucketCount: number; periodLabel: string; theme: Theme; onClose: () => void }) {
+function TrendOverlay({ kind, report, quotaTrendData, quotaEfficiencyData, remaining, isCurrentPeriod, peakUnit, bucketCount, periodLabel, theme, onClose }:
+  { kind: TrendKind; report: PeriodReport; quotaTrendData: ReturnType<typeof quotaPeriodTrend>; quotaEfficiencyData: ReturnType<typeof quotaEfficiency>; remaining: number | null; isCurrentPeriod: boolean; peakUnit: "tokens" | "cost"; bucketCount: number; periodLabel: string; theme: Theme; onClose: () => void }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKey);
@@ -379,12 +447,13 @@ function TrendOverlay({ kind, report, quotaTrendData, quotaEfficiencyData, peakU
     : report.series.slice(0, bucketCount).map((s) => s.full);
   const chartValues = values;
   const chartLabels = labels;
-  const total = values.reduce((s, v) => s + v, 0);
-  const average = values.length ? total / values.length : 0;
-  const peak = Math.max(...values, 0);
+  const finiteValues = values.filter((value): value is number => value != null && Number.isFinite(value));
+  const total = finiteValues.reduce((s, v) => s + v, 0);
+  const average = finiteValues.length ? total / finiteValues.length : 0;
+  const peak = Math.max(...finiteValues, 0);
   const peakIndex = values.indexOf(peak);
-  const active = values.filter((v) => v > 0).length;
-  const startingRemaining = quotaTrendData.values[0] ?? quotaEfficiencyData.currentRemaining;
+  const active = finiteValues.filter((v) => v > 0).length;
+  const startingRemaining = quotaTrendData.values[0] ?? null;
   const title = kind === "requests"
     ? "响应次数详细趋势"
     : kind === "cost"
@@ -406,10 +475,10 @@ function TrendOverlay({ kind, report, quotaTrendData, quotaEfficiencyData, peakU
             : (v: number, _index?: number) => `$${fmtPeakCost(v)}`
           : (v: number, index = 0) => `${Math.round(v)}% · ${quotaTrendData.annotations[index] || ""}`;
   const summary = kind === "quota" ? [
-    ["当前额度", `${Math.round(quotaEfficiencyData.currentRemaining)}%`],
-    ["阶段起始", `${Math.round(startingRemaining)}%`],
+    [isCurrentPeriod ? "当前额度" : "阶段末次", remaining == null ? "无样本" : `${Math.round(remaining)}%`],
+    ["阶段起始", startingRemaining == null ? "无样本" : `${Math.round(startingRemaining)}%`],
     ["已完成 1% 均值", quotaEfficiencyData.averageCost != null ? `$${fmtPeakCost(quotaEfficiencyData.averageCost)}` : "待累计"],
-    ["当前 1% 累计", quotaEfficiencyData.currentCost > 0 ? `$${fmtPeakCost(quotaEfficiencyData.currentCost)}` : "$0.00"],
+    ["当前 1% 累计", quotaEfficiencyData.currentRemaining == null ? "无样本" : `$${fmtPeakCost(quotaEfficiencyData.currentCost)}`],
   ] : kind === "sessions" ? [
     ["期间去重", `${fmtInt(report.metrics.sessions)}个`],
     ["桶均", `${average.toFixed(2)}个`],
@@ -428,7 +497,7 @@ function TrendOverlay({ kind, report, quotaTrendData, quotaEfficiencyData, peakU
   ];
   const displayPeriod = periodLabel;
   const detailTitle = kind === "quota"
-    ? labels[0] ? `阶段起点：${labels[0]} · ${Math.round(startingRemaining)}%` : displayPeriod
+    ? labels[0] ? `阶段起点：${labels[0]} · ${startingRemaining == null ? "无样本" : `${Math.round(startingRemaining)}%`}` : displayPeriod
     : labels[peakIndex] ? `峰值区间：${labels[peakIndex]}` : displayPeriod;
 
   return <>
@@ -833,52 +902,60 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
   const dragRef = useRef<{ x: number; y: number } | null>(null);
   const [period, setPeriod] = useState<PeriodKind>("Week");
   const [periodOffset, setPeriodOffset] = useState(0);
-  const [historicalReport, setHistoricalReport] = useState<{ key: string; report: PeriodReport } | null>(null);
+  const [historicalReport, setHistoricalReport] = useState<LoadedReport | null>(null);
   const [customRange, setCustomRange] = useState<CustomRange | null>(null);
-  const [customReport, setCustomReport] = useState<{ key: string; report: PeriodReport } | null>(null);
+  const [customReport, setCustomReport] = useState<LoadedReport | null>(null);
+  const [reportError, setReportError] = useState<{ key: string; message: string } | null>(null);
   const [rangePickerOpen, setRangePickerOpen] = useState(false);
   const [detailKind, setDetailKind] = useState<TrendKind | null>(null);
   const [peakUnit, setPeakUnit] = useState<"tokens" | "cost">("tokens");
   const [pinned, setPinned] = useState(false);
   const currentReport: PeriodReport = period === "Hour" ? dash.hour : period === "Day" ? dash.day : period === "Month" ? dash.month : period === "Year" ? dash.year : dash.week;
   const historicalKey = `${period}:${periodOffset}`;
+  const customKey = customRange ? `${customRange.startMs}:${customRange.endMs}` : "";
   useEffect(() => {
     if (periodOffset === 0) {
       setHistoricalReport(null);
       return;
     }
+    if (customRange) return;
+    setReportError(null);
     let cancelled = false;
     const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
     const request = inTauri
       ? invoke<PeriodReport>("get_period_report", { period, offset: periodOffset })
-      : Promise.resolve(currentReport);
+      : Promise.reject(new Error("历史统计需要连接本地应用"));
     request.then((report) => {
       if (!cancelled) setHistoricalReport({ key: historicalKey, report });
-    }).catch((error) => console.error("failed to load historical period", error));
+    }).catch((error) => {
+      if (!cancelled) setReportError({ key: historicalKey, message: "历史统计加载失败，请点击刷新重试" });
+      console.error("failed to load historical period", error);
+    });
     return () => { cancelled = true; };
-  }, [period, periodOffset, dash.generatedAt]);
-  const customKey = customRange ? `${customRange.startMs}:${customRange.endMs}` : "";
+  }, [period, periodOffset, dash.generatedAt, !!customRange]);
   useEffect(() => {
     if (!customRange) {
       setCustomReport(null);
       return;
     }
+    setReportError(null);
     let cancelled = false;
     const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
     const request = inTauri
       ? invoke<PeriodReport>("get_range_report", { startMs: customRange.startMs, endMs: customRange.endMs })
-      : Promise.resolve(currentReport);
+      : Promise.reject(new Error("时间段统计需要连接本地应用"));
     request.then((report) => {
       if (!cancelled) setCustomReport({ key: customKey, report });
-    }).catch((error) => console.error("failed to load custom time range", error));
+    }).catch((error) => {
+      if (!cancelled) setReportError({ key: customKey, message: "时间段统计加载失败，请点击刷新重试" });
+      console.error("failed to load custom time range", error);
+    });
     return () => { cancelled = true; };
   }, [customKey, dash.generatedAt]);
-  const fixedReport: PeriodReport = periodOffset === 0
-    ? currentReport
-    : historicalReport?.key === historicalKey ? historicalReport.report : currentReport;
-  const P: PeriodReport = customRange
-    ? customReport?.key === customKey ? customReport.report : fixedReport
-    : fixedReport;
+  const selectedKey = customRange ? customKey : periodOffset === 0 ? null : historicalKey;
+  const selectedReport = selectPeriodReport(currentReport, selectedKey, customRange ? customReport : historicalReport);
+  const selectedError = selectedKey != null && reportError?.key === selectedKey ? reportError.message : null;
+  const P = selectedReport ?? EMPTY_REPORT;
   const M = P.metrics;
   // animated Total tokens: counts up from 0 on each open / period switch;
   // held at 0 while the popover is hidden so it never flashes the final value.
@@ -913,15 +990,10 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
     ? { title: `${trendSub}分段热力图`, columns: 6, autoColumns: false, peakSub: "单分段最高 Token" }
     : fixedHeatmapMeta;
   const annualHeatmap = !customRange && period === "Year";
-  const stagePeak = P.series.reduce((peak, point, index) => {
-    const tokens = point.input + point.cache + point.output;
-    return tokens > peak.tokens
-      ? { tokens, cost: P.costTrend[index] ?? 0 }
-      : peak;
-  }, { tokens: 0, cost: 0 });
   const primaryLimit = dash.rateLimits?.primary || null;
   const primaryRemaining = primaryLimit ? remainingPct(primaryLimit.usedPercent) : 0;
   const visibleBucketCount = customRange ? P.series.length : periodOffset === 0 ? activeBucketCount(period, dash.generatedAt) : P.series.length;
+  const stagePeak = reportPeaks(P, visibleBucketCount);
   const requestTrendValues = P.reqTrend.slice(0, visibleBucketCount);
   const costTrendValues = P.costTrend.slice(0, visibleBucketCount);
   const sessionTrendValues = (P.sessionTrend || []).slice(0, visibleBucketCount);
@@ -929,12 +1001,12 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
   const quotaPeriod = customRange ? customRangePeriod(customRange) : period;
   const quotaTrendData = quotaPeriodTrend(dash.quotaTrend || [], quotaPeriod, viewGeneratedAt, visibleBucketCount, customRange?.startMs);
   const quotaEfficiencyData = quotaEfficiency(dash.quotaTrend || [], quotaPeriod, viewGeneratedAt, customRange?.startMs);
-  const historicalQuotaAvailable = quotaTrendData.values.length > 0;
+  const historicalQuotaAvailable = quotaTrendData.values.some((value) => value != null);
   const isCurrentFixedPeriod = !customRange && periodOffset === 0;
   const displayedRemaining = isCurrentFixedPeriod
     ? primaryRemaining
     : historicalQuotaAvailable ? quotaEfficiencyData.currentRemaining : null;
-  const quotaSparkValues = historicalQuotaAvailable ? quotaTrendData.values : isCurrentFixedPeriod ? [primaryRemaining] : [0, 0];
+  const quotaSparkValues = historicalQuotaAvailable ? quotaTrendData.values : isCurrentFixedPeriod ? [primaryRemaining] : [null, null];
   const quotaEfficiencyLabel = quotaEfficiencyData.averageCost != null
     ? `1%均≈$${fmtPeakCost(quotaEfficiencyData.averageCost)}`
     : quotaEfficiencyData.currentCost > 0
@@ -1022,6 +1094,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
         </div>
         {/* single-page body; the heatmap consumes the remaining height */}
         <div style={{ padding: "12px 15px 14px", flex: "1 1 auto", minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+        {selectedReport ? <>
         {/* hero */}
         <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 10 }}>
           <div>
@@ -1094,7 +1167,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
                   style={{ border: 0, borderRadius: 3, padding: "1px 4px", cursor: "pointer", background: peakUnit === unit ? t.segOnBg : "transparent",
                     color: peakUnit === unit ? t.segOnText : t.segOffText, font: `600 8px ${t.mono}` }}>{unit === "tokens" ? "M" : "$"}</button>)}
               </span>} value={peakUnit === "tokens" ? fmtPeakTokens(stagePeak.tokens) : `$${fmtPeakCost(stagePeak.cost)}`}
-              sub={heatmapMeta.peakSub} theme={t} accent={t.accent}
+              sub={heatmapMeta.peakSub.replace("Token", peakUnit === "cost" ? "费用" : "Token")} theme={t} accent={t.accent}
               onClick={() => setDetailKind("peak")}>
               <Sparkline values={(peakUnit === "tokens" ? peakTrendValues : costTrendValues).length ? (peakUnit === "tokens" ? peakTrendValues : costTrendValues) : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
             </MiniStat>
@@ -1105,9 +1178,13 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
         <div style={{ flex: annualHeatmap ? "0 0 80px" : "1 1 0", minHeight: 0 }}>
           <Heatmap data={P.series} columns={heatmapMeta.columns} autoColumns={heatmapMeta.autoColumns} title={heatmapMeta.title} theme={t} accent={t.accent} showRange={!annualHeatmap} />
         </div>
+        </> : <div role="status" aria-live="polite" style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center",
+          textAlign: "center", color: t.dim, font: `500 12px ${t.ui}` }}>
+          {selectedError || "正在加载所选时间段…"}
+        </div>}
         </div>{/* /single-page body */}
       </div>
-      {detailKind && <TrendOverlay kind={detailKind} report={P} quotaTrendData={quotaTrendData} quotaEfficiencyData={quotaEfficiencyData} peakUnit={peakUnit} bucketCount={visibleBucketCount} periodLabel={trendSub} theme={t} onClose={() => setDetailKind(null)} />}
+      {detailKind && selectedReport && <TrendOverlay kind={detailKind} report={P} quotaTrendData={quotaTrendData} quotaEfficiencyData={quotaEfficiencyData} remaining={displayedRemaining} isCurrentPeriod={isCurrentFixedPeriod} peakUnit={peakUnit} bucketCount={visibleBucketCount} periodLabel={trendSub} theme={t} onClose={() => setDetailKind(null)} />}
       {rangePickerOpen && <CustomRangeOverlay
         initialRange={customRange || { startMs: Date.now() - 24 * 60 * 60 * 1000, endMs: Date.now() }}
         theme={t}
