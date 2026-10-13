@@ -345,8 +345,8 @@ function ramp(accent: string, lvl: number, gridLine: string, card: string) {
   return `color-mix(in srgb, ${accent} ${Math.round(op * 100)}%, ${card})`;
 }
 
-export function Heatmap({ data, columns, autoColumns = false, title, theme, accent, gap = 3 }:
-  { data: SeriesPoint[]; columns: number; autoColumns?: boolean; title: string; theme: Theme; accent?: string; gap?: number }) {
+export function Heatmap({ data, columns, autoColumns = false, title, theme, accent, gap = 3, showRange = true }:
+  { data: SeriesPoint[]; columns: number; autoColumns?: boolean; title: string; theme: Theme; accent?: string; gap?: number; showRange?: boolean }) {
   const t = theme; accent = accent || t.accent;
   const [hi, setHi] = useState<SeriesPoint | null>(null);
   const [tip, setTip] = useState({ x: 0, y: 0 });
@@ -405,10 +405,12 @@ export function Heatmap({ data, columns, autoColumns = false, title, theme, acce
           <span>多</span>
         </div>
       </div>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5, font: `500 8.5px ${t.mono}`, color: t.faint }}>
-        <span>{data[0]?.full || ""}</span>
-        <span>{data[data.length - 1]?.full || ""}</span>
-      </div>
+      {showRange && (
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5, font: `500 8.5px ${t.mono}`, color: t.faint }}>
+          <span>{data[0]?.full || ""}</span>
+          <span>{data[data.length - 1]?.full || ""}</span>
+        </div>
+      )}
       <div ref={gridAreaRef} style={{ flex: 1, minHeight: 0, width: "100%", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}>
         <div style={{ display: "grid", gridTemplateColumns: `repeat(${layoutColumns}, ${cellSize}px)`, gridTemplateRows: `repeat(${layoutRows}, ${cellSize}px)`, gap }}>
           {data.map((d, i) => {

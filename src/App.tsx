@@ -912,6 +912,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
   const heatmapMeta = customRange
     ? { title: `${trendSub}分段热力图`, columns: 6, autoColumns: false, peakSub: "单分段最高 Token" }
     : fixedHeatmapMeta;
+  const annualHeatmap = !customRange && period === "Year";
   const stagePeak = P.series.reduce((peak, point, index) => {
     const tokens = point.input + point.cache + point.output;
     return tokens > peak.tokens
@@ -1046,8 +1047,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
         </div>
         <SplitLegend t={t} inputM={M.inputTokens} cacheM={M.cacheTokens} outputM={M.outputTokens} />
         {/* bar chart */}
-        <BarChart data={P.series} theme={t} height={84} />
-        <SectionRule t={t} m="14px 0 10px" />
+        <BarChart data={P.series} theme={t} height={annualHeatmap ? 76 : 84} />
+        <SectionRule t={t} m={annualHeatmap ? "12px 0 8px" : "14px 0 10px"} />
         {/* models */}
         <div style={{ marginBottom: 4 }}><Label t={t}>各模型 Token</Label></div>
         {tokenModels.length === 0 && <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint, padding: "4px 0" }}>此周期暂无用量</div>}
@@ -1056,7 +1057,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
         {/* estimated API value donut */}
         <div style={{ marginBottom: 8 }}><Label t={t}>各模型 API 等值费用</Label></div>
         {costModels.length > 0
-          ? <CostDonut models={costModels} theme={t} size={100} thickness={15} />
+          ? <CostDonut models={costModels} theme={t} size={annualHeatmap ? 92 : 100} thickness={annualHeatmap ? 14 : 15} />
           : <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint }}>—</div>}
         {unpricedModels.length > 0 && (
           <div style={{ marginTop: 9, font: `500 9.5px/1.5 ${t.mono}`, color: t.faint }}>
@@ -1064,7 +1065,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
             <span style={{ color: t.dim }}>{unpricedModels.map((m) => m.name).join(", ")}</span>
           </div>
         )}
-        <SectionRule t={t} m="12px 0 12px" />
+        <SectionRule t={t} m={annualHeatmap ? "10px 0 10px" : "12px 0 12px"} />
         {/* footer stats */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
           <MiniStat label="响应次数" value={fmtInt(M.requests)} sub={`${M.sessions} 个会话`} theme={t}
@@ -1101,8 +1102,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, onRefresh, openGen, activ
         </div>
         {/* heatmap */}
         <SectionRule t={t} m="10px 0 9px" />
-        <div style={{ flex: "1 1 0", minHeight: 0 }}>
-          <Heatmap data={P.series} columns={heatmapMeta.columns} autoColumns={heatmapMeta.autoColumns} title={heatmapMeta.title} theme={t} accent={t.accent} />
+        <div style={{ flex: annualHeatmap ? "0 0 80px" : "1 1 0", minHeight: 0 }}>
+          <Heatmap data={P.series} columns={heatmapMeta.columns} autoColumns={heatmapMeta.autoColumns} title={heatmapMeta.title} theme={t} accent={t.accent} showRange={!annualHeatmap} />
         </div>
         </div>{/* /single-page body */}
       </div>
